@@ -1,7 +1,7 @@
-site_name: bt_api_monitoring Documentation
+site_name: bt_api_monitor Documentation
 site_description: Monitoring module for bt_api ecosystem
 site_author: cloudQuant
-site_url: https://cloudquant.github.io/bt_api_monitoring/
+site_url: https://cloudquant.github.io/bt_api_monitor/
 
 repo_name: cloudQuant/bt_api
 repo_url: https://github.com/cloudquant/bt_api

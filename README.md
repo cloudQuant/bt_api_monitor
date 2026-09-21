@@ -1,4 +1,4 @@
-# bt_api_monitoring
+# bt_api_monitor
 
 [![Python 3.9-3.14](https://img.shields.io/badge/python-3.9--3.14-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
@@ -34,8 +34,14 @@ Performance monitoring system for the bt_api ecosystem. Provides real-time metri
 ## Installation
 
 ```bash
-pip install bt_api_monitoring
+pip install bt_api_monitor
 ```
+
+### Rename notice
+
+The canonical distribution and import are now `bt_api_monitor`.  The former
+`bt_api_monitoring` import remains as a deprecated compatibility shim for one
+migration window; update imports before the next breaking release.
 
 ## Requirements
 
@@ -47,7 +53,7 @@ pip install bt_api_monitoring
 ## Quick Start
 
 ```python
-from bt_api_monitoring import MetricsCollector, counter, gauge, histogram
+from bt_api_monitor import MetricsCollector, counter, gauge, histogram
 
 # Use the global collector
 collector = MetricsCollector()
@@ -62,7 +68,7 @@ gauge("active_connections", tags={"exchange": "binance"}).set(42)
 histogram("request_latency_seconds", tags={"method": "GET"}).observe(0.123)
 
 # Start global monitoring
-from bt_api_monitoring import start_global_monitoring, stop_global_monitoring
+from bt_api_monitor import start_global_monitoring, stop_global_monitoring
 start_global_monitoring()
 # ... your code ...
 stop_global_monitoring()
@@ -71,7 +77,7 @@ stop_global_monitoring()
 ### Exchange Health Check
 
 ```python
-from bt_api_monitoring import ExchangeHealthMonitor, HealthCheckFactory
+from bt_api_monitor import ExchangeHealthMonitor, HealthCheckFactory
 
 monitor = ExchangeHealthMonitor()
 check = HealthCheckFactory.create("binance_spot", timeout=5.0)
@@ -82,7 +88,7 @@ print(f"Status: {result.status}, latency: {result.latency_ms}ms")
 ### Prometheus Export
 
 ```python
-from bt_api_monitoring import start_prometheus_exporter, stop_prometheus_exporter
+from bt_api_monitor import start_prometheus_exporter, stop_prometheus_exporter
 
 start_prometheus_exporter(port=9090)
 # Metrics are now available at http://localhost:9090/metrics

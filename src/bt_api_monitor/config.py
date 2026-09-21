@@ -10,7 +10,7 @@ from pathlib import Path
 
 from bt_api_py.logging_system import get_logger, setup_logging_for_production
 
-from bt_api_monitoring import (
+from bt_api_monitor import (
     get_all_dashboard_configs,
     save_dashboard_to_file,
     setup_elk_integration,
@@ -149,7 +149,7 @@ async def setup_grafana_dashboards(output_dir: str) -> None:
 
 async def cleanup_monitoring() -> None:
     """Cleanup monitoring resources."""
-    from bt_api_monitoring import (
+    from bt_api_monitor import (
         shutdown_elk_integration,
         stop_global_monitoring,
         stop_prometheus_exporter,

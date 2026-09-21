@@ -152,7 +152,7 @@ async def trading_bot():
 
 async def monitor_system_health():
     """Monitor system health and report status."""
-    from bt_api_monitoring import get_global_collector
+    from bt_api_monitor import get_global_collector
 
     collector = get_global_collector()
 

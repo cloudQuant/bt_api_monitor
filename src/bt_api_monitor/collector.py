@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from bt_api_monitoring.system_metrics import (
+from bt_api_monitor.system_metrics import (
     get_business_collector,
     get_system_collector,
 )

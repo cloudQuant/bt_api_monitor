@@ -15,7 +15,7 @@ from typing import Any
 
 import psutil
 
-from bt_api_monitoring.metrics import Counter, Gauge, Histogram, Metric, MetricRegistry
+from bt_api_monitor.metrics import Counter, Gauge, Histogram, Metric, MetricRegistry
 
 
 @dataclass

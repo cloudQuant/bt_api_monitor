@@ -7,7 +7,7 @@ Demonstrates how to use monitoring, logging, and observability features.
 import asyncio
 import time
 
-from bt_api_monitoring import (
+from bt_api_monitor import (
     ExchangeHealthMonitor,
     HealthCheckFactory,
     counter,

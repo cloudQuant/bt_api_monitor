@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from bt_api_monitoring.metrics import Counter, Gauge, Histogram, get_registry
+from bt_api_monitor.metrics import Counter, Gauge, Histogram, get_registry
 
 
 class HealthStatus(Enum):

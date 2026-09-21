@@ -1,14 +1,14 @@
 ---
-title: Home | bt_api_monitoring
+title: Home | bt_api_monitor
 ---
 
-# bt_api_monitoring Documentation
+# bt_api_monitor Documentation
 
 Performance monitoring system for the bt_api ecosystem. Provides real-time metrics collection, exchange health monitoring, and integrations with Prometheus, Grafana, and ELK stack.
 
 ## Overview
 
-`bt_api_monitoring` provides a comprehensive monitoring solution with:
+`bt_api_monitor` provides a comprehensive monitoring solution with:
 
 - **Metrics** — Counter, Gauge, Histogram, Timer with Prometheus naming conventions
 - **Decorators** — `@monitor_performance`, `@monitor_async_performance` for automatic profiling
@@ -27,7 +27,7 @@ Performance monitoring system for the bt_api ecosystem. Provides real-time metri
 ## Quick Start
 
 ```python
-from bt_api_monitoring import MetricsCollector, counter, gauge, histogram
+from bt_api_monitor import MetricsCollector, counter, gauge, histogram
 
 # Create and use metrics
 counter("requests_total", tags={"endpoint": "/api/v1/ticker"}).inc()
@@ -38,7 +38,7 @@ histogram("request_latency_seconds", tags={"method": "GET"}).observe(0.123)
 ### Exchange Health Check
 
 ```python
-from bt_api_monitoring import ExchangeHealthMonitor, HealthCheckFactory
+from bt_api_monitor import ExchangeHealthMonitor, HealthCheckFactory
 
 monitor = ExchangeHealthMonitor()
 check = HealthCheckFactory.create("binance_spot", timeout=5.0)
@@ -49,7 +49,7 @@ print(f"Status: {result.status}, latency: {result.latency_ms}ms")
 ### Prometheus Export
 
 ```python
-from bt_api_monitoring import start_prometheus_exporter, stop_prometheus_exporter
+from bt_api_monitor import start_prometheus_exporter, stop_prometheus_exporter
 
 start_prometheus_exporter(port=9090)
 ```
@@ -57,8 +57,14 @@ start_prometheus_exporter(port=9090)
 ## Installation
 
 ```bash
-pip install bt_api_monitoring
+pip install bt_api_monitor
 ```
+
+## Rename notice
+
+Use `bt_api_monitor` for new installations and imports.  The former
+`bt_api_monitoring` import is temporarily supported with a deprecation warning
+so existing callers can migrate deliberately.
 
 ## Dependencies
 
