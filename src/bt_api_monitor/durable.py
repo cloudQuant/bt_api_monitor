@@ -92,6 +92,7 @@ class SequencedOutboxEvent:
 
 
 OutboxDeliveryCallable = Callable[[SequencedOutboxEvent], None]
+_MAX_READ_PAGE_SIZE = 1000
 
 
 class DurableOutbox:
@@ -160,6 +161,37 @@ class DurableOutbox:
                 (scope, checkpoint, limit),
             ).fetchall()
         return [self._sequenced_from_row(row) for row in rows]
+
+    def read_page(
+        self, scope: str, event_type: str, after_sequence: int, limit: int
+    ) -> tuple[list[SequencedOutboxEvent], bool]:
+        """Read a bounded, unacknowledged-independent page for one event scope.
+
+        Unlike :meth:`read_pending`, this read-only projection does not consult
+        or advance a consumer checkpoint.  The caller owns a scope-bound cursor
+        and must validate it before passing its sequence here.
+        """
+
+        if not isinstance(scope, str) or not scope.strip():
+            raise ValueError("scope is required")
+        if not isinstance(event_type, str) or not event_type.strip():
+            raise ValueError("event_type is required")
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a nonnegative exact integer")
+        if type(limit) is not int or not 1 <= limit <= _MAX_READ_PAGE_SIZE:
+            raise ValueError("limit is outside the bounded page range")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT sequence, event_id, scope, event_type, data_json, occurred_at
+                FROM monitor_outbox_events
+                WHERE scope = ? AND event_type = ? AND sequence > ?
+                ORDER BY sequence ASC LIMIT ?
+                """,
+                (scope, event_type, after_sequence, limit + 1),
+            ).fetchall()
+        has_more = len(rows) > limit
+        return [self._sequenced_from_row(row) for row in rows[:limit]], has_more
 
     def acknowledge(self, consumer_id: str, scope: str, sequence: int) -> None:
         """Advance one consumer by exactly its next event in this scope."""

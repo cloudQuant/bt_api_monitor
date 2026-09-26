@@ -71,6 +71,14 @@ from .exchange_health import (
     HealthCheckResult,
     HealthStatus,
 )
+from .facts import (
+    EconomicFactReadModel,
+    FactCursorError,
+    FactPage,
+    FactReadError,
+    FactRecord,
+    export_fact_page,
+)
 from .grafana import (
     GrafanaDashboardBuilder,
     create_exchange_dashboard,
@@ -131,6 +139,12 @@ __all__ = [
     "OutboxError",
     "OutboxEvent",
     "SequencedOutboxEvent",
+    "EconomicFactReadModel",
+    "FactCursorError",
+    "FactPage",
+    "FactReadError",
+    "FactRecord",
+    "export_fact_page",
     "ClaimedControlCommand",
     "ControlAction",
     "ControlAuthorizationError",
