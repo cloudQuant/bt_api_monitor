@@ -532,6 +532,17 @@ def _validate_quality_wire(
             parsed_values[name] = _durations(raw)
         else:
             parsed_values[name] = _decimal_wire(raw, f"execution.{name}")
+    for name in (
+        "arrival_bid",
+        "arrival_ask",
+        "arrival_mid",
+        "native_quantity",
+        "contract_multiplier",
+        "vwap",
+    ):
+        measurement = parsed_values[name]
+        if isinstance(measurement, Decimal) and measurement <= 0:
+            raise FactReadError(f"invalid execution.{name}")
     if execution["slippage_sign_convention"] != "positive_is_adverse":
         raise FactReadError("unsupported slippage sign convention")
     if execution["stage_durations_clock"] != "monotonic":

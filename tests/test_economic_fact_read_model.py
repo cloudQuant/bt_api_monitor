@@ -373,6 +373,57 @@ def test_quality_field_cannot_claim_complete_without_measurement_basis(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("schema_version", ("v1", "v2"))
+@pytest.mark.parametrize(
+    ("section", "field_name", "value"),
+    (
+        ("arrival", "bid", "0"),
+        ("arrival", "ask", "-1"),
+        ("arrival", "mid", "0"),
+        ("execution", "native_quantity", "-1"),
+        ("execution", "native_quantity", "0"),
+        ("execution", "contract_multiplier", "0"),
+        ("execution", "vwap", "0"),
+    ),
+)
+def test_nonpositive_quality_measurements_reject_even_when_incomplete(
+    read_model, schema_version, section, field_name, value
+):
+    fact = _quality_fact()
+    fact["schema"] = f"bt_api.execution.execution_quality.{schema_version}"
+    if schema_version == "v1":
+        fact["scope"].pop("generation_kind")  # type: ignore[union-attr]
+        for basis_name in ("native_quantity_basis", "vwap_basis", "fee_basis"):
+            fact["execution"].pop(basis_name)  # type: ignore[union-attr]
+    fact[section][field_name] = value  # type: ignore[index]
+
+    with pytest.raises(FactReadError, match="invalid execution"):
+        read_model.append_execution_quality(
+            f"quality-nonpositive-{schema_version}-{section}-{field_name}-{value}",
+            fact,
+            1_700_000_000.0,
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("schema_version", ("v1", "v2"))
+def test_signed_cumulative_fee_remains_valid_for_maker_rebate(read_model, schema_version):
+    fact = _quality_fact()
+    fact["schema"] = f"bt_api.execution.execution_quality.{schema_version}"
+    if schema_version == "v1":
+        fact["scope"].pop("generation_kind")  # type: ignore[union-attr]
+        for basis_name in ("native_quantity_basis", "vwap_basis", "fee_basis"):
+            fact["execution"].pop(basis_name)  # type: ignore[union-attr]
+    else:
+        fact["execution"]["fee_basis"] = "ORDER_CUMULATIVE"  # type: ignore[index]
+    fact["execution"]["fee"] = "-0.03"  # type: ignore[index]
+
+    read_model.append_execution_quality(
+        f"quality-negative-fee-{schema_version}", fact, 1_700_000_000.0
+    )
+
+
+@pytest.mark.unit
 def test_legacy_v1_complete_fact_is_rejected_on_append_and_downgraded_on_read(read_model):
     from bt_api_monitor.durable import OutboxEvent
     from bt_api_monitor.facts import _outbox_scope, _scope_digest
