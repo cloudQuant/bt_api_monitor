@@ -20,6 +20,7 @@ _SCOPE = {
     "provider": "SIM",
     "environment": "simulation",
     "account_fingerprint": "a" * 64,
+    "generation_kind": "EXECUTION_JOURNAL",
     "generation": "generation-7",
     "trading_day": "20260926",
     "epoch": 3,
@@ -69,7 +70,7 @@ def _account_fact(
     *, scope: dict[str, object] | None = None, as_of_ns: int = 200, **overrides
 ) -> dict[str, object]:
     fact: dict[str, object] = {
-        "schema": "bt_api.execution.account_snapshot.v1",
+        "schema": "bt_api.execution.account_snapshot.v2",
         "fact_type": "account_snapshot",
         "scope": dict(_SCOPE if scope is None else scope),
         "as_of_ns": as_of_ns,
@@ -97,7 +98,7 @@ def _quality_fact(
     *, scope: dict[str, object] | None = None, as_of_ns: int = 200, **overrides
 ) -> dict[str, object]:
     fact: dict[str, object] = {
-        "schema": "bt_api.execution.execution_quality.v1",
+        "schema": "bt_api.execution.execution_quality.v2",
         "fact_type": "execution_quality",
         "scope": dict(_QUALITY_SCOPE if scope is None else scope),
         "intent_id": "intent-1",
@@ -123,9 +124,12 @@ def _quality_fact(
         "execution": {
             "side": None,
             "native_quantity": None,
+            "native_quantity_basis": None,
             "contract_multiplier": None,
             "vwap": None,
+            "vwap_basis": None,
             "fee": None,
+            "fee_basis": None,
             "fee_currency": None,
             "slippage_amount": None,
             "slippage_bps": None,
@@ -161,9 +165,12 @@ def _complete_quality_fact() -> dict[str, object]:
     fact["execution"] = {
         "side": "BUY",
         "native_quantity": "2.00",
+        "native_quantity_basis": "ORDER_CUMULATIVE",
         "contract_multiplier": "1",
         "vwap": "100.10",
+        "vwap_basis": "ORDER_CUMULATIVE",
         "fee": "0.03",
+        "fee_basis": "ORDER_CUMULATIVE",
         "fee_currency": "USD",
         "slippage_amount": "0.20",
         "slippage_bps": "10",
@@ -181,6 +188,27 @@ def _complete_quality_fact() -> dict[str, object]:
             "source_refs": [f"source-{field}"],
         }
         for field in _QUALITY_VALUES
+    }
+    return fact
+
+
+def _complete_account_fact_v1(scope: dict[str, object]) -> dict[str, object]:
+    fact = _account_fact(scope=scope, completeness="COMPLETE")
+    fact["values"] = dict.fromkeys(_ACCOUNT_VALUES, "1.00")
+    fact["field_evidence"] = {
+        field: {
+            "completeness": "COMPLETE",
+            "coverage_start_ns": 100,
+            "coverage_end_ns": 200,
+            "source_refs": [f"source-{field}"],
+        }
+        for field in _ACCOUNT_VALUES
+    }
+    fact["external_activity_attribution"] = "COMPLETE"
+    fact["external_activity_evidence"] = {
+        "coverage_start_ns": 100,
+        "coverage_end_ns": 200,
+        "source_refs": ["external-activity-source"],
     }
     return fact
 
@@ -245,7 +273,7 @@ def test_export_is_one_bounded_page_and_does_not_claim_complete_history(read_mod
 
     payload = json.loads(read_model.export_account_snapshots(_SCOPE, limit=1))
 
-    assert payload["schema"] == "bt_api.monitor.economic_fact_page.v1"
+    assert payload["schema"] == "bt_api.monitor.economic_fact_page.v2"
     assert payload["complete_export"] is False
     assert payload["export_kind"] == "bounded_page"
     assert payload["has_more"] is True
@@ -306,6 +334,83 @@ def test_complete_quality_fact_requires_execution_side(read_model):
     missing_side["execution"]["side"] = None  # type: ignore[index]
     with pytest.raises(FactReadError, match="quality fact claims COMPLETE"):
         read_model.append_execution_quality("quality-without-side", missing_side, 1_700_000_001.0)
+
+
+@pytest.mark.unit
+def test_complete_quality_fact_requires_explicit_measurement_bases(read_model):
+    fact = _complete_quality_fact()
+    fact["execution"]["fee_basis"] = None  # type: ignore[index]
+    with pytest.raises(FactReadError, match="explicit measurement basis|claims COMPLETE"):
+        read_model.append_execution_quality("quality-without-basis", fact, 1_700_000_000.0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("field_name", "basis_name", "value"),
+    (
+        ("native_quantity", "native_quantity_basis", "2.00"),
+        ("vwap", "vwap_basis", "100.10"),
+        ("fee", "fee_basis", "0.03"),
+    ),
+)
+def test_quality_field_cannot_claim_complete_without_measurement_basis(
+    read_model, field_name, basis_name, value
+):
+    fact = _quality_fact()
+    fact["execution"][field_name] = value  # type: ignore[index]
+    fact["execution"][basis_name] = None  # type: ignore[index]
+    fact["field_evidence"][field_name] = {  # type: ignore[index]
+        "completeness": "COMPLETE",
+        "coverage_start_ns": 100,
+        "coverage_end_ns": 200,
+        "source_refs": [f"source-{field_name}"],
+    }
+
+    with pytest.raises(FactReadError, match="requires an explicit measurement basis"):
+        read_model.append_execution_quality(
+            f"quality-field-without-{basis_name}", fact, 1_700_000_000.0
+        )
+
+
+@pytest.mark.unit
+def test_legacy_v1_complete_fact_is_rejected_on_append_and_downgraded_on_read(read_model):
+    from bt_api_monitor.durable import OutboxEvent
+    from bt_api_monitor.facts import _outbox_scope, _scope_digest
+
+    legacy_scope = {key: value for key, value in _SCOPE.items() if key != "generation_kind"}
+    legacy = _complete_account_fact_v1(legacy_scope)
+    legacy["schema"] = "bt_api.execution.account_snapshot.v1"
+    with pytest.raises(FactReadError, match="legacy v1 COMPLETE"):
+        read_model.append_account_snapshot("legacy-complete-new", legacy, 1_700_000_000.0)
+
+    legacy_complete = legacy
+    scope_digest = _scope_digest(legacy_scope)
+    read_model._outbox.append(
+        OutboxEvent(
+            event_id="legacy-complete-stored",
+            scope=_outbox_scope("account_snapshot", scope_digest),
+            event_type="account_snapshot",
+            data=legacy_complete,
+            occurred_at=1_700_000_000.0,
+        )
+    )
+    page = read_model.read_account_snapshots(legacy_scope)
+    record = page.records[0]
+    assert record.stored_schema == "bt_api.execution.account_snapshot.v1"
+    assert record.stored_completeness == "COMPLETE"
+    assert record.effective_completeness == "INCOMPLETE"
+    assert record.fact["completeness"] == "INCOMPLETE"
+    exported = json.loads(export_fact_page(page))
+    assert exported["schema"] == "bt_api.monitor.economic_fact_page.v2"
+    assert exported["records"][0]["stored_completeness"] == "COMPLETE"
+    assert exported["records"][0]["effective_completeness"] == "INCOMPLETE"
+
+
+@pytest.mark.unit
+def test_v1_cursor_cannot_be_replayed_in_v2_page(read_model):
+    read_model.append_account_snapshot("account-1", _account_fact(), 1_700_000_000.0)
+    with pytest.raises(FactCursorError, match="invalid cursor"):
+        read_model.read_account_snapshots(_SCOPE, cursor=f"mf1:account_snapshot:{'a' * 64}:1")
 
 
 @pytest.mark.unit

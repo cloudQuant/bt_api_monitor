@@ -21,9 +21,11 @@ from typing import Any
 
 from .durable import DurableOutbox, OutboxEvent, SequencedOutboxEvent
 
-_ACCOUNT_SCHEMA = "bt_api.execution.account_snapshot.v1"
-_QUALITY_SCHEMA = "bt_api.execution.execution_quality.v1"
-_PAGE_SCHEMA = "bt_api.monitor.economic_fact_page.v1"
+_ACCOUNT_SCHEMA_V1 = "bt_api.execution.account_snapshot.v1"
+_QUALITY_SCHEMA_V1 = "bt_api.execution.execution_quality.v1"
+_ACCOUNT_SCHEMA_V2 = "bt_api.execution.account_snapshot.v2"
+_QUALITY_SCHEMA_V2 = "bt_api.execution.execution_quality.v2"
+_PAGE_SCHEMA = "bt_api.monitor.economic_fact_page.v2"
 _ACCOUNT_FACT = "account_snapshot"
 _QUALITY_FACT = "execution_quality"
 _FACT_TYPES = frozenset({_ACCOUNT_FACT, _QUALITY_FACT})
@@ -76,6 +78,9 @@ class FactRecord:
     event_id: str
     occurred_at: float
     fact: Mapping[str, Any]
+    stored_schema: str | None = None
+    stored_completeness: str | None = None
+    effective_completeness: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +108,7 @@ class EconomicFactReadModel:
     ) -> SequencedOutboxEvent:
         """Append one immutable account fact; exact event retries are idempotent."""
 
-        normalized = _validate_fact_wire(fact, _ACCOUNT_FACT)
+        normalized = _validate_fact_wire(fact, _ACCOUNT_FACT, for_append=True)
         return self._append(event_id, normalized, occurred_at, _ACCOUNT_FACT)
 
     def append_execution_quality(
@@ -111,7 +116,7 @@ class EconomicFactReadModel:
     ) -> SequencedOutboxEvent:
         """Append one immutable strategy execution fact without attribution math."""
 
-        normalized = _validate_fact_wire(fact, _QUALITY_FACT)
+        normalized = _validate_fact_wire(fact, _QUALITY_FACT, for_append=True)
         return self._append(event_id, normalized, occurred_at, _QUALITY_FACT)
 
     def read_account_snapshots(
@@ -181,12 +186,18 @@ class EconomicFactReadModel:
             normalized_fact = _validate_fact_wire(item.event.data, fact_type)
             if normalized_fact["scope"] != normalized_scope:
                 raise FactReadError("stored fact scope does not match its outbox partition")
+            stored_schema = normalized_fact["schema"]
+            stored_completeness = normalized_fact["completeness"]
+            effective_fact = _effective_fact_projection(normalized_fact)
             records.append(
                 FactRecord(
                     sequence=item.sequence,
                     event_id=item.event.event_id,
                     occurred_at=item.event.occurred_at,
-                    fact=_freeze_json(normalized_fact),
+                    fact=_freeze_json(effective_fact),
+                    stored_schema=stored_schema,
+                    stored_completeness=stored_completeness,
+                    effective_completeness=effective_fact["completeness"],
                 )
             )
         next_cursor = cursor
@@ -246,12 +257,40 @@ def export_fact_page(page: FactPage) -> str:
         fact = _validate_fact_wire(record.fact, page.fact_type)
         if fact["scope"] != scope:
             raise FactReadError("record scope does not match exported page scope")
+        stored_schema = record.stored_schema or fact["schema"]
+        stored_completeness = record.stored_completeness or fact["completeness"]
+        if stored_schema not in {
+            _ACCOUNT_SCHEMA_V1,
+            _QUALITY_SCHEMA_V1,
+            _ACCOUNT_SCHEMA_V2,
+            _QUALITY_SCHEMA_V2,
+        }:
+            raise FactReadError("record has an unsupported stored schema")
+        if stored_schema != fact["schema"]:
+            raise FactReadError("record stored schema does not match its fact")
+        if stored_completeness not in _COMPLETENESS:
+            raise FactReadError("record has an invalid stored completeness")
+        expected_effective = (
+            "INCOMPLETE"
+            if stored_schema in {_ACCOUNT_SCHEMA_V1, _QUALITY_SCHEMA_V1}
+            and stored_completeness == "COMPLETE"
+            else stored_completeness
+        )
+        if fact["completeness"] != expected_effective:
+            raise FactReadError("record fact does not match its stored completeness")
+        effective_fact = _effective_fact_projection(fact, stored_schema, stored_completeness)
+        effective_completeness = record.effective_completeness or effective_fact["completeness"]
+        if effective_completeness != effective_fact["completeness"]:
+            raise FactReadError("record effective completeness does not match its fact")
         normalized_records.append(
             {
                 "sequence": sequence,
                 "event_id": event_id,
                 "occurred_at": float(occurred_at),
-                "fact": fact,
+                "stored_schema": stored_schema,
+                "stored_completeness": stored_completeness,
+                "effective_completeness": effective_completeness,
+                "fact": effective_fact,
             }
         )
     if normalized_records and (cursor_sequence is None or cursor_sequence != previous_sequence):
@@ -271,11 +310,13 @@ def export_fact_page(page: FactPage) -> str:
     )
 
 
-def _validate_fact_wire(value: Mapping[str, Any], expected_fact: str) -> dict[str, Any]:
+def _validate_fact_wire(
+    value: Mapping[str, Any], expected_fact: str, *, for_append: bool = False
+) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise FactReadError("fact must be a mapping")
     if expected_fact == _ACCOUNT_FACT:
-        expected_schema = _ACCOUNT_SCHEMA
+        expected_schemas = {_ACCOUNT_SCHEMA_V1, _ACCOUNT_SCHEMA_V2}
         expected_keys = {
             "schema",
             "fact_type",
@@ -293,7 +334,7 @@ def _validate_fact_wire(value: Mapping[str, Any], expected_fact: str) -> dict[st
             "equity_includes_fees",
         }
     elif expected_fact == _QUALITY_FACT:
-        expected_schema = _QUALITY_SCHEMA
+        expected_schemas = {_QUALITY_SCHEMA_V1, _QUALITY_SCHEMA_V2}
         expected_keys = {
             "schema",
             "fact_type",
@@ -310,17 +351,34 @@ def _validate_fact_wire(value: Mapping[str, Any], expected_fact: str) -> dict[st
         }
     else:
         raise FactReadError("unknown fact type")
+    if value.get("schema") in {_ACCOUNT_SCHEMA_V2, _QUALITY_SCHEMA_V2}:
+        scope = _mapping(value.get("scope"), "scope")
+        expected_scope_keys = {
+            "provider",
+            "environment",
+            "account_fingerprint",
+            "generation_kind",
+            "generation",
+            "trading_day",
+            "epoch",
+            "strategy_id",
+        }
+        if set(scope) != expected_scope_keys:
+            raise FactReadError("v2 scope keys invalid")
     _exact_keys(value, expected_keys, "fact")
-    if value["schema"] != expected_schema or value["fact_type"] != expected_fact:
+    if value["schema"] not in expected_schemas or value["fact_type"] != expected_fact:
         raise FactReadError("fact schema/version mismatch")
+    is_v2 = value["schema"] in {_ACCOUNT_SCHEMA_V2, _QUALITY_SCHEMA_V2}
+    if for_append and not is_v2 and value.get("completeness") == "COMPLETE":
+        raise FactReadError("legacy v1 COMPLETE facts cannot be newly appended")
     as_of_ns = _exact_positive_int(value["as_of_ns"], "as_of_ns")
     _identifier(value["source"], "source")
     _validate_completeness(value["completeness"], "completeness")
-    scope = _validate_scope(value["scope"], expected_fact)
+    scope = _validate_scope(value["scope"], expected_fact, schema_v2=is_v2)
     if expected_fact == _ACCOUNT_FACT:
         _validate_account_wire(value, scope, as_of_ns)
     else:
-        _validate_quality_wire(value, scope, as_of_ns)
+        _validate_quality_wire(value, scope, as_of_ns, schema_v2=is_v2)
     return _plain_json(value)
 
 
@@ -385,13 +443,20 @@ def _validate_account_wire(value: Mapping[str, Any], scope: dict[str, Any], as_o
         or value["reporting_currency"] is None
         or direction is None
         or scope["trading_day"] is None
+        or scope["generation"] is None
         or external != "COMPLETE"
         or value["equity_includes_fees"] is None
     ):
         raise FactReadError("account fact claims COMPLETE with missing evidence")
 
 
-def _validate_quality_wire(value: Mapping[str, Any], scope: dict[str, Any], as_of_ns: int) -> None:
+def _validate_quality_wire(
+    value: Mapping[str, Any],
+    scope: dict[str, Any],
+    as_of_ns: int,
+    *,
+    schema_v2: bool,
+) -> None:
     _identifier(value["intent_id"], "intent_id")
     _currency_or_none(value["currency"], "currency")
     lineage = _mapping(value["lineage"], "lineage")
@@ -432,7 +497,19 @@ def _validate_quality_wire(value: Mapping[str, Any], scope: dict[str, Any], as_o
         "rejection_reason",
         "legacy_metrics",
     }
+    if schema_v2:
+        execution_keys |= {"native_quantity_basis", "vwap_basis", "fee_basis"}
     _exact_keys(execution, execution_keys, "execution")
+    quantity_basis = execution.get("native_quantity_basis")
+    vwap_basis = execution.get("vwap_basis")
+    fee_basis = execution.get("fee_basis")
+    for name, basis in (
+        ("native_quantity_basis", quantity_basis),
+        ("vwap_basis", vwap_basis),
+        ("fee_basis", fee_basis),
+    ):
+        if basis is not None and basis not in {"TRADE", "ORDER_CUMULATIVE"}:
+            raise FactReadError(f"invalid {name}")
     side = execution["side"]
     if side is not None and (not isinstance(side, str) or side not in {"BUY", "SELL"}):
         raise FactReadError("invalid execution side")
@@ -463,6 +540,11 @@ def _validate_quality_wire(value: Mapping[str, Any], scope: dict[str, Any], as_o
     reason = execution["rejection_reason"]
     if reason is not None:
         _identifier(reason, "execution.rejection_reason")
+    if (
+        any(basis == "TRADE" for basis in (quantity_basis, vwap_basis, fee_basis))
+        and lineage["trade_id"] is None
+    ):
+        raise FactReadError("TRADE measurement basis requires trade_id")
     legacy = _mapping(execution["legacy_metrics"], "execution.legacy_metrics")
     _exact_keys(legacy, {"latency_ms_unscoped", "slippage_untyped"}, "execution.legacy_metrics")
     legacy_latency = _decimal_wire(legacy["latency_ms_unscoped"], "legacy latency")
@@ -474,6 +556,14 @@ def _validate_quality_wire(value: Mapping[str, Any], scope: dict[str, Any], as_o
     evidence = _validate_field_evidence(
         value["field_evidence"], _QUALITY_VALUES, parsed_values, as_of_ns
     )
+    if schema_v2:
+        for field_name, basis in (
+            ("native_quantity", quantity_basis),
+            ("vwap", vwap_basis),
+            ("fee", fee_basis),
+        ):
+            if evidence[field_name]["completeness"] == "COMPLETE" and basis is None:
+                raise FactReadError(f"complete {field_name} requires an explicit measurement basis")
     if value["completeness"] == "COMPLETE" and (
         any(parsed_values[name] is None for name in _QUALITY_VALUES)
         or any(evidence[name]["completeness"] != "COMPLETE" for name in _QUALITY_VALUES)
@@ -481,6 +571,10 @@ def _validate_quality_wire(value: Mapping[str, Any], scope: dict[str, Any], as_o
         or (parsed_values["fee"] is not None and fee_currency is None)
         or side is None
         or scope["trading_day"] is None
+        or scope["generation"] is None
+        or quantity_basis is None
+        or vwap_basis is None
+        or (parsed_values["fee"] is not None and fee_basis is None)
         or any(lineage[name] is None for name in ("signal_id", "child_id", "order_id"))
         or (lineage["trade_id"] is None and reason is None)
         or arrival_as_of is None
@@ -532,31 +626,49 @@ def _validate_field_evidence(
     return normalized
 
 
-def _validate_scope(raw: Any, fact_type: str) -> dict[str, Any]:
+def _validate_scope(raw: Any, fact_type: str, *, schema_v2: bool | None = None) -> dict[str, Any]:
     scope = _mapping(raw, "scope")
-    _exact_keys(
-        scope,
-        {
-            "provider",
-            "environment",
-            "account_fingerprint",
-            "generation",
-            "trading_day",
-            "epoch",
-            "strategy_id",
-        },
-        "scope",
-    )
+    if schema_v2 is None:
+        schema_v2 = "generation_kind" in scope
+    expected_keys = {
+        "provider",
+        "environment",
+        "account_fingerprint",
+        "generation",
+        "trading_day",
+        "epoch",
+        "strategy_id",
+    }
+    if schema_v2:
+        expected_keys.add("generation_kind")
+    _exact_keys(scope, expected_keys, "scope")
     _identifier(scope["provider"], "scope.provider")
     _identifier(scope["environment"], "scope.environment")
     if not isinstance(scope["account_fingerprint"], str) or not _FINGERPRINT_RE.fullmatch(
         scope["account_fingerprint"]
     ):
         raise FactReadError("invalid account fingerprint")
-    _identifier(scope["generation"], "scope.generation")
+    generation = scope["generation"]
+    if generation is not None:
+        _identifier(generation, "scope.generation")
+    elif not schema_v2:
+        raise FactReadError("v1 scope requires a generation")
+    if schema_v2:
+        generation_kind = scope["generation_kind"]
+        if generation_kind is not None and generation_kind not in {
+            "EXECUTION_JOURNAL",
+            "PROVIDER_SESSION",
+        }:
+            raise FactReadError("invalid scope.generation_kind")
+        if (generation_kind is None) != (generation is None):
+            raise FactReadError("scope generation kind and identity must be paired")
     if scope["trading_day"] is not None:
         _identifier(scope["trading_day"], "scope.trading_day")
-    _exact_positive_int(scope["epoch"], "scope.epoch")
+    if scope["epoch"] is None:
+        if generation is not None:
+            raise FactReadError("scoped generation requires an epoch")
+    else:
+        _exact_positive_int(scope["epoch"], "scope.epoch")
     strategy_id = scope["strategy_id"]
     if fact_type == _ACCOUNT_FACT:
         if strategy_id is not None:
@@ -650,7 +762,7 @@ def _outbox_scope(fact_type: str, scope_digest: str) -> str:
 def _encode_cursor(scope_digest: str, fact_type: str, sequence: int) -> str:
     if type(sequence) is not int or not 0 < sequence <= _MAX_CURSOR_SEQUENCE:
         raise FactCursorError("cursor sequence is outside the supported range")
-    return f"mf1:{fact_type}:{scope_digest}:{sequence}"
+    return f"mf2:{fact_type}:{scope_digest}:{sequence}"
 
 
 def _decode_cursor(cursor: str | None, scope_digest: str, fact_type: str) -> int:
@@ -659,7 +771,7 @@ def _decode_cursor(cursor: str | None, scope_digest: str, fact_type: str) -> int
     if not isinstance(cursor, str) or len(cursor) > 256:
         raise FactCursorError("invalid cursor")
     match = re.fullmatch(
-        r"mf1:(account_snapshot|execution_quality):([0-9a-f]{64}):([1-9][0-9]{0,18})", cursor
+        r"mf2:(account_snapshot|execution_quality):([0-9a-f]{64}):([1-9][0-9]{0,18})", cursor
     )
     if match is None:
         raise FactCursorError("invalid cursor")
@@ -669,6 +781,22 @@ def _decode_cursor(cursor: str | None, scope_digest: str, fact_type: str) -> int
     if sequence > _MAX_CURSOR_SEQUENCE:
         raise FactCursorError("cursor sequence is outside the supported range")
     return sequence
+
+
+def _effective_fact_projection(
+    fact: Mapping[str, Any],
+    stored_schema: str | None = None,
+    stored_completeness: str | None = None,
+) -> dict[str, Any]:
+    """Keep legacy storage immutable while downgrading unsafe v1 COMPLETE reads."""
+
+    normalized = _plain_json(fact)
+    schema = stored_schema or normalized["schema"]
+    completeness = stored_completeness or normalized["completeness"]
+    v1_schemas = {_ACCOUNT_SCHEMA_V1, _QUALITY_SCHEMA_V1}
+    if schema in v1_schemas and completeness == "COMPLETE":
+        normalized["completeness"] = "INCOMPLETE"
+    return normalized
 
 
 def _plain_json(value: Any) -> Any:
