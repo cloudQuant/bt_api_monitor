@@ -583,9 +583,14 @@ def _validate_quality_wire(
         or side is None
         or scope["trading_day"] is None
         or scope["generation"] is None
-        or quantity_basis is None
-        or vwap_basis is None
-        or (parsed_values["fee"] is not None and fee_basis is None)
+        or (
+            schema_v2
+            and (
+                quantity_basis is None
+                or vwap_basis is None
+                or (parsed_values["fee"] is not None and fee_basis is None)
+            )
+        )
         or any(lineage[name] is None for name in ("signal_id", "child_id", "order_id"))
         or (lineage["trade_id"] is None and reason is None)
         or arrival_as_of is None
@@ -807,6 +812,19 @@ def _effective_fact_projection(
     v1_schemas = {_ACCOUNT_SCHEMA_V1, _QUALITY_SCHEMA_V1}
     if schema in v1_schemas and completeness == "COMPLETE":
         normalized["completeness"] = "INCOMPLETE"
+    if schema == _QUALITY_SCHEMA_V1:
+        evidence = normalized.get("field_evidence")
+        if isinstance(evidence, dict):
+            # V1 did not identify whether cumulative-looking quantities, VWAP,
+            # and fees were per-trade deltas or order snapshots. Keep stored
+            # bytes untouched, but do not expose those fields as semantically
+            # complete in the effective projection.
+            for name in ("native_quantity", "vwap", "fee"):
+                field_evidence = evidence.get(name)
+                if isinstance(field_evidence, dict) and field_evidence.get("completeness") == (
+                    "COMPLETE"
+                ):
+                    field_evidence["completeness"] = "INCOMPLETE"
     return normalized
 
 

@@ -458,6 +458,46 @@ def test_legacy_v1_complete_fact_is_rejected_on_append_and_downgraded_on_read(re
 
 
 @pytest.mark.unit
+def test_legacy_v1_quality_read_downgrades_basis_ambiguous_scalar_fields(read_model):
+    from bt_api_monitor.durable import OutboxEvent
+    from bt_api_monitor.facts import _outbox_scope, _scope_digest
+
+    legacy_scope = {key: value for key, value in _QUALITY_SCOPE.items() if key != "generation_kind"}
+    legacy = _complete_quality_fact()
+    legacy["schema"] = "bt_api.execution.execution_quality.v1"
+    legacy["scope"] = legacy_scope
+    for basis_name in ("native_quantity_basis", "vwap_basis", "fee_basis"):
+        legacy["execution"].pop(basis_name)  # type: ignore[union-attr]
+    with pytest.raises(FactReadError, match="legacy v1 COMPLETE"):
+        read_model.append_execution_quality("legacy-quality-complete-new", legacy, 1_700_000_000.0)
+
+    scope_digest = _scope_digest(legacy_scope)
+    partition = _outbox_scope("execution_quality", scope_digest)
+    read_model._outbox.append(
+        OutboxEvent(
+            event_id="legacy-quality-complete-stored",
+            scope=partition,
+            event_type="execution_quality",
+            data=legacy,
+            occurred_at=1_700_000_000.0,
+        )
+    )
+    page = read_model.read_execution_quality(legacy_scope)
+    record = page.records[0]
+    assert record.stored_schema == "bt_api.execution.execution_quality.v1"
+    assert record.stored_completeness == "COMPLETE"
+    assert record.effective_completeness == "INCOMPLETE"
+    assert record.fact["completeness"] == "INCOMPLETE"
+    for field_name in ("native_quantity", "vwap", "fee"):
+        assert record.fact["field_evidence"][field_name]["completeness"] == "INCOMPLETE"
+    assert record.fact["field_evidence"]["arrival_mid"]["completeness"] == "COMPLETE"
+    exported = json.loads(export_fact_page(page))
+    exported_fact = exported["records"][0]["fact"]
+    assert exported_fact["completeness"] == "INCOMPLETE"
+    assert exported_fact["field_evidence"]["native_quantity"]["completeness"] == "INCOMPLETE"
+
+
+@pytest.mark.unit
 def test_v1_cursor_cannot_be_replayed_in_v2_page(read_model):
     read_model.append_account_snapshot("account-1", _account_fact(), 1_700_000_000.0)
     with pytest.raises(FactCursorError, match="invalid cursor"):
