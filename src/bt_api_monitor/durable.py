@@ -150,16 +150,30 @@ class DurableOutbox:
         if limit <= 0:
             raise ValueError("limit must be positive")
         with self._connection() as connection:
-            checkpoint = self._checkpoint(connection, consumer_id, scope)
-            rows = connection.execute(
-                """
-                SELECT sequence, event_id, scope, event_type, data_json, occurred_at
-                FROM monitor_outbox_events
-                WHERE scope = ? AND sequence > ?
-                ORDER BY sequence ASC LIMIT ?
-                """,
-                (scope, checkpoint, limit),
-            ).fetchall()
+            return self._read_pending_on_connection(connection, consumer_id, scope, limit)
+
+    def _read_pending_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        consumer_id: str,
+        scope: str,
+        limit: int,
+    ) -> list[SequencedOutboxEvent]:
+        """Read pending rows on a caller-owned, non-transactional connection."""
+        if not consumer_id.strip() or not scope.strip():
+            raise ValueError("consumer_id and scope are required")
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        checkpoint = self._checkpoint(connection, consumer_id, scope)
+        rows = connection.execute(
+            """
+            SELECT sequence, event_id, scope, event_type, data_json, occurred_at
+            FROM monitor_outbox_events
+            WHERE scope = ? AND sequence > ?
+            ORDER BY sequence ASC LIMIT ?
+            """,
+            (scope, checkpoint, limit),
+        ).fetchall()
         return [self._sequenced_from_row(row) for row in rows]
 
     def read_page(
@@ -197,10 +211,29 @@ class DurableOutbox:
         """Advance one consumer by exactly its next event in this scope."""
         if not consumer_id.strip() or not scope.strip() or sequence <= 0:
             raise ValueError("consumer_id, scope, and positive sequence are required")
-        with self._transaction() as connection:
+        with self._connection() as connection:
+            self._acknowledge_on_connection(connection, consumer_id, scope, sequence)
+
+    def _acknowledge_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        consumer_id: str,
+        scope: str,
+        sequence: int,
+    ) -> None:
+        """Commit one acknowledgement on a caller-owned connection.
+
+        The caller must not hold a transaction across delivery callbacks. Each
+        invocation owns one independent ``BEGIN IMMEDIATE``/``COMMIT`` pair.
+        """
+        if not consumer_id.strip() or not scope.strip() or sequence <= 0:
+            raise ValueError("consumer_id, scope, and positive sequence are required")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
             checkpoint = self._checkpoint(connection, consumer_id, scope)
             if sequence <= checkpoint:
                 if sequence == checkpoint:
+                    connection.execute("COMMIT")
                     return
                 raise CheckpointError("consumer checkpoint cannot regress")
             next_row = connection.execute(
@@ -221,6 +254,26 @@ class DurableOutbox:
                 """,
                 (consumer_id, scope, sequence, self._clock()),
             )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+
+    def _can_reuse_consumer_connection(self) -> bool:
+        """Whether the consumer may use the built-in read/ack implementations.
+
+        ``read_pending`` and ``acknowledge`` remain dynamically dispatched
+        extension points. If a subclass or instance overrides either public
+        method, the consumer preserves that behavior through the original
+        public-call path instead of bypassing the override with these helpers.
+        """
+        return (
+            type(self).read_pending is _DURABLE_OUTBOX_READ_PENDING
+            and type(self).acknowledge is _DURABLE_OUTBOX_ACKNOWLEDGE
+            and "read_pending" not in self.__dict__
+            and "acknowledge" not in self.__dict__
+        )
 
     def checkpoint(self, consumer_id: str, scope: str) -> int:
         """Return the last durably acknowledged sequence for a consumer and scope."""
@@ -298,6 +351,12 @@ class DurableOutbox:
                 connection.execute("COMMIT")
 
 
+# Keep references to the original methods so monkeypatching the class itself
+# remains visible to the consumer's extension-point detection.
+_DURABLE_OUTBOX_READ_PENDING = DurableOutbox.read_pending
+_DURABLE_OUTBOX_ACKNOWLEDGE = DurableOutbox.acknowledge
+
+
 class DurableOutboxConsumer:
     """Consume one scoped outbox cursor with explicit at-least-once semantics.
 
@@ -355,7 +414,34 @@ class DurableOutboxConsumer:
         cursor remains at the last known acknowledgement.
         """
 
+        if self._outbox._can_reuse_consumer_connection():
+            with self._outbox._connection() as connection:
+                pending = self._outbox._read_pending_on_connection(
+                    connection, self._consumer_id, self._scope, limit
+                )
+                return self._deliver_and_ack(
+                    pending,
+                    lambda item: self._outbox._acknowledge_on_connection(
+                        connection, self._consumer_id, self._scope, item.sequence
+                    ),
+                )
+
+        # Preserve dynamic public method overrides on subclasses and instances.
+        # Such overrides may add behavior to the documented read/ack API, so
+        # they keep the original one-operation-per-connection path.
         pending = self._outbox.read_pending(self._consumer_id, self._scope, limit)
+        return self._deliver_and_ack(
+            pending,
+            lambda item: self._outbox.acknowledge(
+                self._consumer_id, self._scope, item.sequence
+            ),
+        )
+
+    def _deliver_and_ack(
+        self,
+        pending: list[SequencedOutboxEvent],
+        acknowledge: Callable[[SequencedOutboxEvent], None],
+    ) -> list[SequencedOutboxEvent]:
         delivered: list[SequencedOutboxEvent] = []
         for item in pending:
             try:
@@ -365,7 +451,7 @@ class DurableOutboxConsumer:
                     "outbox delivery failed; event remains pending for replay"
                 ) from error
             try:
-                self._outbox.acknowledge(self._consumer_id, self._scope, item.sequence)
+                acknowledge(item)
             except Exception as error:
                 raise OutboxDeliveryError(
                     "outbox delivery was not checkpointed; event may be delivered again"

@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from threading import Barrier
 
 import pytest
@@ -169,6 +170,27 @@ def test_outbox_idempotency_checkpoint_and_cross_instance_replay(tmp_path) -> No
     assert reader.read_pending("consumer", "account:1") == []
 
 
+@pytest.mark.parametrize(
+    ("consumer_id", "scope", "limit"),
+    [
+        ("", "account:1", 10),
+        ("consumer", " ", 10),
+        ("consumer", "account:1", 0),
+    ],
+)
+def test_read_pending_rejects_invalid_arguments_before_opening_sqlite(
+    tmp_path, monkeypatch, consumer_id, scope, limit
+) -> None:
+    outbox = DurableOutbox(tmp_path / "monitor.db")
+
+    def unexpected_connection():
+        raise AssertionError("invalid input must be rejected before opening SQLite")
+
+    monkeypatch.setattr(outbox, "_connection", unexpected_connection)
+    with pytest.raises(ValueError):
+        outbox.read_pending(consumer_id, scope, limit)
+
+
 def test_outbox_rejects_conflicting_event_or_sensitive_data(tmp_path) -> None:
     outbox = DurableOutbox(tmp_path / "monitor.db")
     outbox.append(event("event-1"))
@@ -212,6 +234,16 @@ def test_outbox_consumer_replays_after_sink_or_checkpoint_failure(tmp_path, monk
     outbox = DurableOutbox(database)
     item = outbox.append(event("consume-retry"))
     calls: list[str] = []
+    connections: list[sqlite3.Connection] = []
+    original_connection = outbox._connection
+
+    @contextmanager
+    def tracked_connection():
+        with original_connection() as connection:
+            connections.append(connection)
+            yield connection
+
+    monkeypatch.setattr(outbox, "_connection", tracked_connection)
 
     def unavailable(entry) -> None:
         calls.append(entry.event.event_id)
@@ -220,6 +252,9 @@ def test_outbox_consumer_replays_after_sink_or_checkpoint_failure(tmp_path, monk
     consumer = DurableOutboxConsumer(outbox, "monitor.sink", "account:1", unavailable)
     with pytest.raises(OutboxDeliveryError, match="remains pending"):
         consumer.consume()
+    assert len(connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connections[0].execute("SELECT 1")
     assert consumer.checkpoint() == 0
 
     acknowledged_calls: list[str] = []
@@ -247,6 +282,225 @@ def test_outbox_consumer_replays_after_sink_or_checkpoint_failure(tmp_path, monk
     # durable acknowledgement can suppress the next replay.
     assert calls == ["consume-retry"]
     assert acknowledged_calls == ["consume-retry", "consume-retry"]
+
+
+def test_outbox_consumer_reuses_one_closed_connection_per_consume(tmp_path, monkeypatch) -> None:
+    outbox = DurableOutbox(tmp_path / "monitor.db")
+    first = outbox.append(event("batch-1"))
+    second = outbox.append(event("batch-2"))
+    connections: list[sqlite3.Connection] = []
+    original_connection = outbox._connection
+
+    @contextmanager
+    def tracked_connection():
+        with original_connection() as connection:
+            connections.append(connection)
+            yield connection
+
+    monkeypatch.setattr(outbox, "_connection", tracked_connection)
+    callback_connections: list[sqlite3.Connection] = []
+
+    def deliver(item) -> None:
+        del item
+        connection = connections[0]
+        assert connection.in_transaction is False
+        callback_connections.append(connection)
+
+    consumer = DurableOutboxConsumer(outbox, "monitor.sink", "account:1", deliver)
+    assert [item.sequence for item in consumer.consume()] == [first.sequence, second.sequence]
+    assert len(connections) == 1
+    assert callback_connections == [connections[0], connections[0]]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connections[0].execute("SELECT 1")
+
+    assert consumer.consume() == []
+    assert len(connections) == 2
+    assert connections[1] is not connections[0]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connections[1].execute("SELECT 1")
+
+    monkeypatch.undo()
+    assert consumer.checkpoint() == second.sequence
+
+
+def test_consumer_callback_can_reenter_outbox_read_and_write(tmp_path) -> None:
+    outbox = DurableOutbox(tmp_path / "monitor.db")
+    first = outbox.append(event("reentrant-1"))
+    second = outbox.append(event("reentrant-2"))
+    callback_state: list[tuple[bool, list[str]]] = []
+    appended = False
+    batch_connection: sqlite3.Connection | None = None
+    original_connection = outbox._connection
+
+    @contextmanager
+    def tracked_connection():
+        nonlocal batch_connection
+        with original_connection() as connection:
+            if batch_connection is None:
+                batch_connection = connection
+            yield connection
+
+    outbox._connection = tracked_connection
+
+    def deliver(item) -> None:
+        nonlocal appended
+        assert batch_connection is not None
+        callback_state.append(
+            (
+                batch_connection.in_transaction,
+                [row.event.event_id for row in outbox.read_pending("observer", "account:1")],
+            )
+        )
+        if not appended:
+            outbox.append(event("reentrant-written"))
+            appended = True
+
+    consumer = DurableOutboxConsumer(outbox, "monitor.sink", "account:1", deliver)
+    assert [item.sequence for item in consumer.consume()] == [first.sequence, second.sequence]
+    assert callback_state == [
+        (False, ["reentrant-1", "reentrant-2"]),
+        (False, ["reentrant-1", "reentrant-2", "reentrant-written"]),
+    ]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        assert batch_connection is not None
+        batch_connection.execute("SELECT 1")
+
+    outbox._connection = original_connection
+    replay_consumer = DurableOutboxConsumer(
+        outbox, "monitor.sink", "account:1", lambda _item: None
+    )
+    replay = replay_consumer.consume()
+    assert [item.event.event_id for item in replay] == ["reentrant-written"]
+
+
+def test_consumer_rolls_back_failed_ack_transaction_and_replays_only_unacked_rows(
+    tmp_path, monkeypatch
+) -> None:
+    database = tmp_path / "monitor.db"
+    outbox = DurableOutbox(database)
+    first = outbox.append(event("commit-1"))
+    second = outbox.append(event("commit-2"))
+    third = outbox.append(event("commit-3"))
+    delivered: list[str] = []
+    connections: list[sqlite3.Connection] = []
+    statements: list[str] = []
+    original_connection = outbox._connection
+
+    setup_connection = sqlite3.connect(str(database))
+    try:
+        setup_connection.executescript(
+            """
+            CREATE TRIGGER fail_second_checkpoint_update
+            AFTER UPDATE ON monitor_consumer_checkpoints
+            WHEN NEW.sequence = 2
+            BEGIN
+                SELECT RAISE(FAIL, 'injected second acknowledgement failure');
+            END;
+            """
+        )
+    finally:
+        setup_connection.close()
+
+    @contextmanager
+    def faulting_connection():
+        with original_connection() as connection:
+            connections.append(connection)
+            connection.set_trace_callback(lambda statement: statements.append(statement.strip()))
+            yield connection
+
+    monkeypatch.setattr(outbox, "_connection", faulting_connection)
+
+    def deliver(item) -> None:
+        assert len(connections) == 1
+        assert connections[0].in_transaction is False
+        delivered.append(item.event.event_id)
+
+    consumer = DurableOutboxConsumer(outbox, "monitor.sink", "account:1", deliver)
+    with pytest.raises(OutboxDeliveryError, match="not checkpointed"):
+        consumer.consume()
+
+    assert [statement.upper() for statement in statements].count("BEGIN IMMEDIATE") == 2
+    assert [statement.upper() for statement in statements].count("COMMIT") == 1
+    assert [statement.upper() for statement in statements].count("ROLLBACK") == 1
+    assert delivered == ["commit-1", "commit-2"]
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        connections[0].execute("SELECT 1")
+
+    monkeypatch.undo()
+    assert consumer.checkpoint() == first.sequence
+    assert [row.event.event_id for row in outbox.read_pending("monitor.sink", "account:1")] == [
+        "commit-2",
+        "commit-3",
+    ]
+    recovery_connection = sqlite3.connect(str(database))
+    try:
+        recovery_connection.execute("DROP TRIGGER fail_second_checkpoint_update")
+        recovery_connection.commit()
+    finally:
+        recovery_connection.close()
+    replaying = DurableOutboxConsumer(
+        outbox,
+        "monitor.sink",
+        "account:1",
+        lambda item: delivered.append(item.event.event_id),
+    )
+    assert [row.event.event_id for row in replaying.consume()] == ["commit-2", "commit-3"]
+    assert replaying.checkpoint() == third.sequence
+    assert delivered == ["commit-1", "commit-2", "commit-2", "commit-3"]
+
+
+def test_outbox_consumer_preserves_public_method_overrides(tmp_path) -> None:
+    class OverridingOutbox(DurableOutbox):
+        def __init__(self, database_path) -> None:
+            super().__init__(database_path)
+            self.acknowledged: list[int] = []
+            self.read_calls = 0
+
+        def read_pending(self, consumer_id: str, scope: str, limit: int = 100):
+            self.read_calls += 1
+            return super().read_pending(consumer_id, scope, limit)
+
+        def acknowledge(self, consumer_id: str, scope: str, sequence: int) -> None:
+            self.acknowledged.append(sequence)
+            super().acknowledge(consumer_id, scope, sequence)
+
+    outbox = OverridingOutbox(tmp_path / "monitor.db")
+    first = outbox.append(event("override-1"))
+    second = outbox.append(event("override-2"))
+    consumer = DurableOutboxConsumer(outbox, "monitor.sink", "account:1", lambda _item: None)
+
+    assert [item.sequence for item in consumer.consume()] == [first.sequence, second.sequence]
+    assert outbox.read_calls == 1
+    assert outbox.acknowledged == [first.sequence, second.sequence]
+    assert consumer.checkpoint() == second.sequence
+
+
+def test_outbox_consumer_preserves_class_level_public_method_patches(tmp_path, monkeypatch) -> None:
+    outbox = DurableOutbox(tmp_path / "monitor.db")
+    first = outbox.append(event("class-patch-1"))
+    second = outbox.append(event("class-patch-2"))
+    original_read = DurableOutbox.read_pending
+    original_acknowledge = DurableOutbox.acknowledge
+    calls: list[tuple[str, int | None]] = []
+
+    def patched_read(self, consumer_id: str, scope: str, limit: int = 100):
+        calls.append(("read", None))
+        return original_read(self, consumer_id, scope, limit)
+
+    def patched_acknowledge(self, consumer_id: str, scope: str, sequence: int) -> None:
+        calls.append(("acknowledge", sequence))
+        original_acknowledge(self, consumer_id, scope, sequence)
+
+    monkeypatch.setattr(DurableOutbox, "read_pending", patched_read)
+    monkeypatch.setattr(DurableOutbox, "acknowledge", patched_acknowledge)
+    consumer = DurableOutboxConsumer(outbox, "monitor.sink", "account:1", lambda _item: None)
+
+    assert [item.sequence for item in consumer.consume()] == [first.sequence, second.sequence]
+    assert calls == [
+        ("read", None),
+        ("acknowledge", first.sequence),
+        ("acknowledge", second.sequence),
+    ]
 
 
 def test_control_ledger_is_idempotent_and_single_executor(tmp_path) -> None:
