@@ -96,6 +96,22 @@ start_prometheus_exporter(port=9090)
 
 ## API Reference
 
+### Durable event delivery and control ingress
+
+`OutboxEvent` accepts redacted JSON facts. `DurableOutbox` stores them in SQLite
+with event-ID deduplication and scoped checkpoints. `DurableOutboxConsumer`
+calls an injected synchronous sink and advances the checkpoint only after the
+sink returns. A sink can receive the same event again if it accepts an event
+but the checkpoint write fails, so sinks should deduplicate by `event_id`.
+
+`ControlIngress` accepts a `ControlCommandEnvelope` only after an injected
+verifier validates it. `HmacControlCommandVerifier` supports canonical HMAC
+envelopes and exact, time-bound key and scope grants through injected resolver
+interfaces. The package does not include a key store, issuer-policy source,
+provider client, or command executor. `DurableControlLedger` persists verified
+commands and coordinates owner claims; the account owner must independently
+guard each action and record its outcome.
+
 | Class / Function | Description |
 |-----------------|-------------|
 | `MetricsCollector` | Centralized metrics collector |
@@ -108,6 +124,9 @@ start_prometheus_exporter(port=9090)
 | `GrafanaDashboardBuilder` | Grafana dashboard JSON generator |
 | `ELKIntegration` | Elasticsearch/Logstash integration |
 | `SystemMetricsCollector` | System resource metrics |
+| `DurableOutbox` / `DurableOutboxConsumer` | SQLite event outbox with at-least-once delivery |
+| `ControlIngress` / `DurableControlLedger` | Verified control ingress and durable owner claims |
+| `HmacControlCommandVerifier` | HMAC envelope and exact-grant verification |
 
 ## Documentation
 
