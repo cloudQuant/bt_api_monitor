@@ -69,6 +69,7 @@ histogram("request_latency_seconds", tags={"method": "GET"}).observe(0.123)
 
 # Start global monitoring
 from bt_api_monitor import start_global_monitoring, stop_global_monitoring
+
 start_global_monitoring()
 # ... your code ...
 stop_global_monitoring()
