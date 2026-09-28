@@ -200,11 +200,15 @@ class TestDecorators:
         """Test timer context manager."""
         histogram = Histogram("timer_test", "Timer test")
 
-        with timer(histogram):
-            time.sleep(0.01)
+        with patch(
+            "bt_api_monitor.metrics.time.perf_counter", side_effect=(10.0, 10.025)
+        ) as clock:
+            with timer(histogram):
+                pass
 
+        assert clock.call_count == 2
         assert histogram.get_count() == 1
-        assert histogram.get_sum() > 0.01
+        assert histogram.get_sum() == pytest.approx(0.025)
 
 
 class TestExchangeHealthMonitor:
