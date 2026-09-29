@@ -432,9 +432,7 @@ class DurableOutboxConsumer:
         pending = self._outbox.read_pending(self._consumer_id, self._scope, limit)
         return self._deliver_and_ack(
             pending,
-            lambda item: self._outbox.acknowledge(
-                self._consumer_id, self._scope, item.sequence
-            ),
+            lambda item: self._outbox.acknowledge(self._consumer_id, self._scope, item.sequence),
         )
 
     def _deliver_and_ack(

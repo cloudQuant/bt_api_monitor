@@ -366,9 +366,7 @@ def test_consumer_callback_can_reenter_outbox_read_and_write(tmp_path) -> None:
         batch_connection.execute("SELECT 1")
 
     outbox._connection = original_connection
-    replay_consumer = DurableOutboxConsumer(
-        outbox, "monitor.sink", "account:1", lambda _item: None
-    )
+    replay_consumer = DurableOutboxConsumer(outbox, "monitor.sink", "account:1", lambda _item: None)
     replay = replay_consumer.consume()
     assert [item.event.event_id for item in replay] == ["reentrant-written"]
 

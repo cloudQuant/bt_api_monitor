@@ -6,6 +6,7 @@ Demonstrates how to use monitoring, logging, and observability features.
 
 import asyncio
 import time
+import uuid
 
 from bt_api_monitor import (
     ExchangeHealthMonitor,
@@ -121,39 +122,31 @@ def demonstrate_structured_logging():
     logger = get_logger("example")
 
     # Generate correlation ID for request
-    logging_manager = get_logging_manager()
-    correlation_id = logging_manager.generate_correlation_id()
+    correlation_id = uuid.uuid4().hex
+    logger.info(
+        "Starting processing correlation_id=%s component=processor step=init", correlation_id
+    )
 
-    with logging_manager.with_correlation_id(correlation_id):
-        logger.info("Starting processing", component="processor", step="init")
-
-        try:
-            # Log API request
-            logger.api_request(
-                method="GET",
-                endpoint="/api/v1/ticker/BTCUSDT",
-                exchange_name="BINANCE",
-                status_code=200,
-                duration_ms=45.5,
-            )
-
-            # Log order event
-            logger.order_event(
-                event_type="placed",
-                exchange_name="BINANCE",
-                symbol="BTCUSDT",
-                side="BUY",
-                quantity=0.1,
-                order_id="12345",
-            )
-
-            # Log connection event
-            logger.connection_event(
-                event_type="connected", exchange_name="BINANCE", connection_type="websocket"
-            )
-
-        except Exception:
-            logger.exception("Processing failed", component="processor", step="execute")
+    try:
+        logger.info(
+            "API request correlation_id=%s method=GET endpoint=/api/v1/ticker/BTCUSDT "
+            "exchange=BINANCE status=200 duration_ms=45.5",
+            correlation_id,
+        )
+        logger.info(
+            "Order event correlation_id=%s event_type=placed exchange=BINANCE "
+            "symbol=BTCUSDT side=BUY quantity=0.1 order_id=12345",
+            correlation_id,
+        )
+        logger.info(
+            "Connection event correlation_id=%s event_type=connected "
+            "exchange=BINANCE connection_type=websocket",
+            correlation_id,
+        )
+    except Exception:
+        logger.exception(
+            "Processing failed correlation_id=%s component=processor step=execute", correlation_id
+        )
 
 
 # Example 8: Business metrics integration
@@ -286,7 +279,6 @@ class TradingBotExample:
 async def main():
     """Main example runner."""
     # Setup logging
-    setup_logging_for_production(log_level="INFO")
     logger = get_logger(__name__)
 
     logger.info("Starting monitoring examples")
