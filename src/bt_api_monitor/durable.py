@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import stat
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -93,6 +94,7 @@ class SequencedOutboxEvent:
 
 OutboxDeliveryCallable = Callable[[SequencedOutboxEvent], None]
 _MAX_READ_PAGE_SIZE = 1000
+_MAX_READ_PAGE_TYPES = 16
 
 
 class DurableOutbox:
@@ -103,15 +105,35 @@ class DurableOutbox:
         database_path: Union[Path, str],  # noqa: UP007 -- Python 3.9 is supported.
         clock: Optional[Callable[[], float]] = None,  # noqa: UP045 -- Python 3.9 is supported.
         timeout_seconds: float = 5.0,
+        *,
+        read_only: bool = False,
     ) -> None:
         self._database_path = Path(database_path)
         self._clock = clock or time.time
         self._timeout_seconds = timeout_seconds
-        self._database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize_schema()
+        if type(read_only) is not bool:
+            raise ValueError("read_only must be a boolean")
+        self._read_only = read_only
+        if read_only:
+            try:
+                info = self._database_path.lstat()
+            except OSError as exc:
+                raise OutboxError("read-only outbox database is unavailable") from exc
+            if not stat.S_ISREG(info.st_mode):
+                raise OutboxError("read-only outbox database must be a regular file")
+        else:
+            self._database_path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize_schema()
+
+    @property
+    def is_read_only(self) -> bool:
+        """Whether this instance is permanently bound to SQLite read-only mode."""
+
+        return self._read_only
 
     def append(self, event: OutboxEvent) -> SequencedOutboxEvent:
         """Persist an event or return its existing sequence for an exact retry."""
+        self._require_writable()
         with self._transaction() as connection:
             existing = connection.execute(
                 "SELECT sequence, event_id, fingerprint, scope, event_type, data_json, occurred_at "
@@ -207,8 +229,56 @@ class DurableOutbox:
         has_more = len(rows) > limit
         return [self._sequenced_from_row(row) for row in rows[:limit]], has_more
 
+    def read_page_types(
+        self, scope: str, event_types: tuple[str, ...], after_sequence: int, limit: int
+    ) -> tuple[list[SequencedOutboxEvent], bool]:
+        """Read one globally ordered page across a bounded event-type set.
+
+        A single SQL statement gives every configured type the same SQLite
+        snapshot.  Separate per-type reads can observe concurrent appends at
+        different times and let a later sequence advance the cursor past an
+        event inserted for an earlier type.
+        """
+
+        if not isinstance(scope, str) or not scope.strip():
+            raise ValueError("scope is required")
+        if (
+            type(event_types) is not tuple
+            or not 1 <= len(event_types) <= _MAX_READ_PAGE_TYPES
+            or any(not isinstance(event_type, str) or not event_type.strip() for event_type in event_types)
+            or len(set(event_types)) != len(event_types)
+        ):
+            raise ValueError("event_types must be a bounded tuple of unique names")
+        if type(after_sequence) is not int or after_sequence < 0:
+            raise ValueError("after_sequence must be a nonnegative exact integer")
+        if type(limit) is not int or not 1 <= limit <= _MAX_READ_PAGE_SIZE:
+            raise ValueError("limit is outside the bounded page range")
+
+        parameters = (
+            scope,
+            *event_types,
+            *(None for _ in range(_MAX_READ_PAGE_TYPES - len(event_types))),
+            after_sequence,
+            limit + 1,
+        )
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT sequence, event_id, scope, event_type, data_json, occurred_at
+                FROM monitor_outbox_events
+                WHERE scope = ? AND event_type IN (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ) AND sequence > ?
+                ORDER BY sequence ASC LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        has_more = len(rows) > limit
+        return [self._sequenced_from_row(row) for row in rows[:limit]], has_more
+
     def acknowledge(self, consumer_id: str, scope: str, sequence: int) -> None:
         """Advance one consumer by exactly its next event in this scope."""
+        self._require_writable()
         if not consumer_id.strip() or not scope.strip() or sequence <= 0:
             raise ValueError("consumer_id, scope, and positive sequence are required")
         with self._connection() as connection:
@@ -288,6 +358,7 @@ class DurableOutbox:
         return int(row["sequence"]) if row is not None else 0
 
     def _initialize_schema(self) -> None:
+        self._require_writable()
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
@@ -328,18 +399,33 @@ class DurableOutbox:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(
-            str(self._database_path), timeout=self._timeout_seconds, isolation_level=None
-        )
+        if self._read_only:
+            connection = sqlite3.connect(
+                self._database_path.absolute().as_uri() + "?mode=ro",
+                uri=True,
+                timeout=self._timeout_seconds,
+                isolation_level=None,
+            )
+        else:
+            connection = sqlite3.connect(
+                str(self._database_path), timeout=self._timeout_seconds, isolation_level=None
+            )
         connection.row_factory = sqlite3.Row
         try:
-            connection.execute("PRAGMA synchronous = FULL")
+            if self._read_only:
+                connection.execute("PRAGMA query_only = ON")
+                row = connection.execute("PRAGMA query_only").fetchone()
+                if row is None or int(row[0]) != 1:
+                    raise OutboxError("read-only SQLite mode could not be verified")
+            else:
+                connection.execute("PRAGMA synchronous = FULL")
             yield connection
         finally:
             connection.close()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
+        self._require_writable()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -349,6 +435,10 @@ class DurableOutbox:
                 raise
             else:
                 connection.execute("COMMIT")
+
+    def _require_writable(self) -> None:
+        if self._read_only:
+            raise OutboxError("read-only outbox cannot perform writes")
 
 
 # Keep references to the original methods so monkeypatching the class itself
@@ -378,6 +468,8 @@ class DurableOutboxConsumer:
     ) -> None:
         if not isinstance(outbox, DurableOutbox):
             raise ValueError("outbox must be a DurableOutbox")
+        if outbox.is_read_only:
+            raise ValueError("outbox consumer requires a writable DurableOutbox")
         if not isinstance(consumer_id, str) or not consumer_id.strip():
             raise ValueError("consumer_id is required")
         if not isinstance(scope, str) or not scope.strip():
@@ -458,7 +550,26 @@ class DurableOutboxConsumer:
         return delivered
 
 
-_SENSITIVE_KEY_PARTS = ("password", "secret", "token", "credential", "private_key", "api_key")
+_SENSITIVE_KEY_PARTS = (
+    "password",
+    "passphrase",
+    "secret",
+    "token",
+    "credential",
+    "privatekey",
+    "apikey",
+)
+
+
+def _is_sensitive_key(value: str) -> bool:
+    """Reject secret field names despite case or common separator changes."""
+
+    if type(value) is not str or len(value.encode("utf-8", "strict")) > 128:
+        raise ValueError("outbox event data field name is invalid")
+    normalized = "".join(
+        character for character in value.casefold() if character.isascii() and character.isalnum()
+    )
+    return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
 
 
 def _validate_redacted_mapping(value: Mapping[str, Any]) -> None:
@@ -467,8 +578,9 @@ def _validate_redacted_mapping(value: Mapping[str, Any]) -> None:
     def visit(item: Any, path: str = "") -> None:
         if isinstance(item, Mapping):
             for key, nested in item.items():
-                normalized_key = str(key).lower()
-                if any(part in normalized_key for part in _SENSITIVE_KEY_PARTS):
+                if type(key) is not str:
+                    raise ValueError("outbox event data mapping keys must be strings")
+                if _is_sensitive_key(key):
                     raise ValueError("outbox event data must be redacted: " + (path + str(key)))
                 visit(nested, path + str(key) + ".")
         elif isinstance(item, (list, tuple)):

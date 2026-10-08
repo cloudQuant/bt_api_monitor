@@ -1,0 +1,5 @@
+# Preserve the reviewed R3 local-component source bytes across checkouts.
+src/bt_api_monitor/__init__.py text eol=crlf
+src/bt_api_monitor/durable.py text eol=crlf
+src/bt_api_monitor/readonly_events.py -text
+tests/test_readonly_events.py -text
