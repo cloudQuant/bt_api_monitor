@@ -31,6 +31,10 @@ class OutboxConflictError(OutboxError):
     """An event id was reused with different immutable content."""
 
 
+class OutboxCapacityError(OutboxError):
+    """A new event would exceed a bounded outbox's retained event capacity."""
+
+
 class CheckpointError(OutboxError):
     """A consumer tried to skip, regress, or acknowledge another scope's event."""
 
@@ -95,6 +99,8 @@ class SequencedOutboxEvent:
 OutboxDeliveryCallable = Callable[[SequencedOutboxEvent], None]
 _MAX_READ_PAGE_SIZE = 1000
 _MAX_READ_PAGE_TYPES = 16
+MAX_OUTBOX_CAPACITY_EVENTS = 1_000_000
+MAX_OUTBOX_CAPACITY_BYTES = 1_073_741_824
 
 
 class DurableOutbox:
@@ -135,33 +141,32 @@ class DurableOutbox:
         """Persist an event or return its existing sequence for an exact retry."""
         self._require_writable()
         with self._transaction() as connection:
-            existing = connection.execute(
-                "SELECT sequence, event_id, fingerprint, scope, event_type, data_json, occurred_at "
-                "FROM monitor_outbox_events WHERE event_id = ?",
-                (event.event_id,),
-            ).fetchone()
-            if existing is not None:
-                if str(existing["fingerprint"]) != event.fingerprint:
-                    raise OutboxConflictError("event_id was reused with different content")
-                return self._sequenced_from_row(existing)
+            return self._append_on_connection(connection, event)
 
-            cursor = connection.execute(
-                """
-                INSERT INTO monitor_outbox_events
-                    (event_id, fingerprint, scope, event_type, data_json, occurred_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.event_id,
-                    event.fingerprint,
-                    event.scope,
-                    event.event_type,
-                    event.data_json,
-                    event.occurred_at,
-                    self._clock(),
-                ),
+    def append_bounded(
+        self,
+        event: OutboxEvent,
+        *,
+        max_events: int,
+        max_bytes: int,
+    ) -> SequencedOutboxEvent:
+        """Append idempotently while bounding retained logical event count and bytes.
+
+        Byte accounting covers UTF-8 bytes for each retained event's ID, scope,
+        type, and canonical ``data_json``. It describes logical event content,
+        not SQLite file size or other database overhead. Capacity checks and the
+        insert run under the same ``BEGIN IMMEDIATE`` transaction.
+        """
+
+        self._require_writable()
+        _validate_capacity_limits(max_events, max_bytes)
+        with self._transaction() as connection:
+            return self._append_on_connection(
+                connection,
+                event,
+                max_events=max_events,
+                max_bytes=max_bytes,
             )
-            return SequencedOutboxEvent(sequence=int(cursor.lastrowid), event=event)
 
     def read_pending(
         self, consumer_id: str, scope: str, limit: int = 100
@@ -344,6 +349,66 @@ class DurableOutbox:
             and "read_pending" not in self.__dict__
             and "acknowledge" not in self.__dict__
         )
+
+    def _append_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        event: OutboxEvent,
+        *,
+        max_events: Optional[int] = None,  # noqa: UP045 -- Python 3.9 compatibility.
+        max_bytes: Optional[int] = None,  # noqa: UP045 -- Python 3.9 compatibility.
+    ) -> SequencedOutboxEvent:
+        existing = connection.execute(
+            "SELECT sequence, event_id, fingerprint, scope, event_type, data_json, occurred_at "
+            "FROM monitor_outbox_events WHERE event_id = ?",
+            (event.event_id,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["fingerprint"]) != event.fingerprint:
+                raise OutboxConflictError("event_id was reused with different content")
+            return self._sequenced_from_row(existing)
+
+        if max_events is not None and max_bytes is not None:
+            new_event_bytes = _event_logical_bytes(event)
+            if new_event_bytes > max_bytes:
+                raise OutboxCapacityError("bounded outbox capacity would be exceeded")
+
+            logical_bytes = 0
+            retained_rows = connection.execute(
+                """
+                SELECT length(CAST(event_id AS BLOB)) +
+                       length(CAST(scope AS BLOB)) +
+                       length(CAST(event_type AS BLOB)) +
+                       length(CAST(data_json AS BLOB)) AS logical_bytes
+                FROM monitor_outbox_events
+                LIMIT ?
+                """,
+                (max_events,),
+            )
+            for event_count, retained in enumerate(retained_rows, start=1):
+                if event_count >= max_events:
+                    raise OutboxCapacityError("bounded outbox capacity would be exceeded")
+                logical_bytes += int(retained["logical_bytes"])
+                if logical_bytes + new_event_bytes > max_bytes:
+                    raise OutboxCapacityError("bounded outbox capacity would be exceeded")
+
+        cursor = connection.execute(
+            """
+            INSERT INTO monitor_outbox_events
+                (event_id, fingerprint, scope, event_type, data_json, occurred_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.fingerprint,
+                event.scope,
+                event.event_type,
+                event.data_json,
+                event.occurred_at,
+                self._clock(),
+            ),
+        )
+        return SequencedOutboxEvent(sequence=int(cursor.lastrowid), event=event)
 
     def checkpoint(self, consumer_id: str, scope: str) -> int:
         """Return the last durably acknowledged sequence for a consumer and scope."""
@@ -624,10 +689,35 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _validate_capacity_limits(max_events: int, max_bytes: int) -> None:
+    if type(max_events) is not int or not 1 <= max_events <= MAX_OUTBOX_CAPACITY_EVENTS:
+        raise ValueError("max_events is outside the bounded capacity range")
+    if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_OUTBOX_CAPACITY_BYTES:
+        raise ValueError("max_bytes is outside the bounded capacity range")
+
+
+def _event_logical_bytes(event: OutboxEvent) -> int:
+    """Count the UTF-8 bytes retained for the event's logical text fields."""
+
+    return _logical_text_bytes(
+        event.event_id,
+        event.scope,
+        event.event_type,
+        event.data_json,
+    )
+
+
+def _logical_text_bytes(*values: str) -> int:
+    return sum(len(value.encode("utf-8", errors="strict")) for value in values)
+
+
 __all__ = [
     "CheckpointError",
     "DurableOutbox",
     "DurableOutboxConsumer",
+    "MAX_OUTBOX_CAPACITY_BYTES",
+    "MAX_OUTBOX_CAPACITY_EVENTS",
+    "OutboxCapacityError",
     "OutboxConflictError",
     "OutboxDeliveryCallable",
     "OutboxDeliveryError",

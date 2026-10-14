@@ -105,6 +105,74 @@ calls an injected synchronous sink and advances the checkpoint only after the
 sink returns. A sink can receive the same event again if it accepts an event
 but the checkpoint write fails, so sinks should deduplicate by `event_id`.
 
+### Optional remote durable event intake
+
+The explicit `durable_ingress` service role exposes `events.append` on
+`service.telemetry_ingress`. The default Monitor role remains read-only.
+Durable event intake has its own operation grant; ordinary `telemetry.append`
+does not authorize it. SDK clients must explicitly request `events.append`
+on their `upstream.telemetry` binding. No optional service is enabled merely
+by installing the package.
+
+Service-manifest component fragment:
+
+```yaml
+components:
+  monitor:
+    config_schema_version: 2
+    settings:
+      instance_id: monitor-events
+      bind_ports: [service.telemetry_ingress]
+      options:
+        role: durable_ingress
+        max_events: 10000
+        max_bytes: 67108864
+        max_event_bytes: 65536
+```
+
+These limits are also the defaults when only the role is specified. The
+trusted resource provider supplies a writable `DurableOutbox` and the
+`WireScope -> MonitorIngressTarget` mapping; YAML cannot choose Python code.
+The outbox closes its short-lived SQLite connections after each operation;
+use `ComponentResources.borrowed` for this instance. The host owns its registry and
+transport lifecycle. The default read role can run in a separate query host
+over a read-only handle to the same database.
+
+Only authenticated service identities can publish through this role. Trusted
+server targets select the outbox scope and allowed event types. A request has
+exactly `schema_version: 1`, `event_id`, `event_type`, `occurred_at`, and `data`;
+it cannot select an account, principal, outbox scope, or producer identity.
+The adapter stores trusted producer metadata separately from the supplied
+payload and namespaces the event ID by producer and authorized scope.
+
+An accepted reply reports the persisted sequence and server event ID. An
+exact retry with the same source ID and content returns the original sequence,
+including after restart; conflicting content is rejected. A timeout or lost
+reply does not prove absence. The SDK does not automatically retry; a producer
+must retain the original ID and content for an explicit replay after normal
+runtime recovery. This intake does not itself create a producer-side outbox or
+make order dispatch and monitor delivery one transaction.
+Source event IDs must stay unique within the logical producer and authorized
+scope across process runs. A new run ID does not turn a reused source event ID
+into a new fact; identical content is still the same event.
+
+`DurableOutbox.append_bounded` checks event-count and retained logical UTF-8
+byte limits in the same SQLite write transaction as insertion. Capacity
+exhaustion rejects a new event without deleting existing facts; exact
+duplicates remain readable at capacity. These are retained event limits,
+not a hard limit on SQLite pages, indexes, or WAL size. The legacy local
+`append` API keeps its existing behavior; other trusted writers sharing the
+database must follow their own retention policy.
+
+Use a separate permanently read-only outbox handle with `MonitorReadService`
+for queries. Publishing a generic event does not certify a complete economic
+fact, strategy ownership, account freshness, or portfolio PnL. Those consumers
+must validate their domain schemas and provenance. This role also does not
+implement lossy strategy heartbeats/metrics, monitoring control, or provider
+connections.
+
+### Control command verification
+
 `ControlIngress` accepts a `ControlCommandEnvelope` only after an injected
 verifier validates it. `HmacControlCommandVerifier` supports canonical HMAC
 envelopes and exact, time-bound key and scope grants through injected resolver
