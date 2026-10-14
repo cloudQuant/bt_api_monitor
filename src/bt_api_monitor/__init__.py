@@ -1,140 +1,182 @@
 """
 Performance monitoring system for bt_api_py.
 
-This module provides comprehensive performance monitoring capabilities including:
-- Real-time metrics collection
-- Performance timing and profiling
-- Resource usage tracking
-- Exchange health monitoring
-- Alert system for critical metrics
-- Prometheus/Grafana integration
-- ELK stack compatibility
+This module provides comprehensive performance monitoring capabilities,
+including real-time metrics collection, performance timing and profiling,
+resource usage tracking, exchange health monitoring, alerts, and integrations
+for Prometheus, Grafana, and ELK.
+
+Public objects are loaded on first access so importing a narrow read-only
+component does not initialize unrelated monitoring integrations.
 """
 
 from __future__ import annotations
 
-from bt_api_base.logging_factory import get_logger
+from importlib import import_module
+from typing import Any
 
-from .collector import (
-    MetricsCollector,
-    PerformanceMetrics,
-    get_global_collector,
-    start_global_monitoring,
-    stop_global_monitoring,
-)
-from .control import (
-    ClaimedControlCommand,
-    ControlAction,
-    ControlAuthorizationError,
-    ControlClaimError,
-    ControlCommand,
-    ControlCommandEnvelope,
-    ControlCommandVerifier,
-    ControlConflictError,
-    ControlIngress,
-    ControlLedgerError,
-    ControlSequenceError,
-    ControlStatus,
-    DurableControlLedger,
-    VerifiedControlCommand,
-)
-from .decorators import (
-    monitor_async_performance,
-    monitor_calls,
-    monitor_execution_time,
-    monitor_performance,
-)
-from .durable import (
-    CheckpointError,
-    DurableOutbox,
-    DurableOutboxConsumer,
-    OutboxConflictError,
-    OutboxDeliveryCallable,
-    OutboxDeliveryError,
-    OutboxError,
-    OutboxEvent,
-    SequencedOutboxEvent,
-)
-from .elk import (
-    ElasticsearchClient,
-    ELKIntegration,
-    LogstashHandler,
-    get_elk_integration,
-    setup_elk_integration,
-    shutdown_elk_integration,
-)
-from .exchange_health import (
-    ExchangeHealthMonitor,
-    ExchangeHealthSummary,
-    HealthCheck,
-    HealthCheckFactory,
-    HealthCheckResult,
-    HealthStatus,
-)
-from .facts import (
-    EconomicFactReadModel,
-    FactCursorError,
-    FactPage,
-    FactReadError,
-    FactRecord,
-    export_fact_page,
-)
-from .grafana import (
-    GrafanaDashboardBuilder,
-    create_exchange_dashboard,
-    create_system_dashboard,
-    create_trading_dashboard,
-    get_all_dashboard_configs,
-    save_dashboard_to_file,
-)
-from .ingress import (
-    CONTROL_COMMAND_HMAC_DOMAIN,
-    ControlIssuerPolicy,
-    ControlIssuerPolicyResolver,
-    ControlKeyResolver,
-    ControlScopeGrant,
-    HmacControlCommandVerifier,
-    HmacControlKey,
-)
-from .metrics import (
-    Counter,
-    Gauge,
-    Histogram,
-    MetricRegistry,
-    PerformanceTimer,
-    counter,
-    gauge,
-    get_registry,
-    histogram,
-    timer,
-)
-from .prometheus import (
-    PrometheusExporter,
-    get_prometheus_exporter,
-    start_prometheus_exporter,
-    stop_prometheus_exporter,
-)
-from .readonly_events import (
-    EVENT_READ_HMAC_DOMAIN,
-    MAX_EVENT_READ_PAGE_SIZE,
-    EventReadAuthenticationError,
-    EventReadCursorError,
-    EventReadError,
-    EventReadItemV1,
-    EventReadPageV1,
-    EventReadReplayError,
-    EventReadRequestV1,
-    ReadOnlyEventService,
-    sign_event_read_request,
-    verify_event_read_page,
-)
-from .system_metrics import (
-    BusinessMetricsCollector,
-    SystemMetrics,
-    SystemMetricsCollector,
-    get_business_collector,
-    get_system_collector,
-)
+_EXPORT_MODULES = {
+    **dict.fromkeys(
+        (
+            "MetricsCollector",
+            "PerformanceMetrics",
+            "get_global_collector",
+            "start_global_monitoring",
+            "stop_global_monitoring",
+        ),
+        ".collector",
+    ),
+    **dict.fromkeys(
+        (
+            "CheckpointError",
+            "DurableOutbox",
+            "DurableOutboxConsumer",
+            "OutboxConflictError",
+            "OutboxDeliveryCallable",
+            "OutboxDeliveryError",
+            "OutboxError",
+            "OutboxEvent",
+            "SequencedOutboxEvent",
+        ),
+        ".durable",
+    ),
+    **dict.fromkeys(
+        (
+            "ClaimedControlCommand",
+            "ControlAction",
+            "ControlAuthorizationError",
+            "ControlClaimError",
+            "ControlCommand",
+            "ControlCommandEnvelope",
+            "ControlCommandVerifier",
+            "ControlConflictError",
+            "ControlIngress",
+            "ControlLedgerError",
+            "ControlSequenceError",
+            "ControlStatus",
+            "DurableControlLedger",
+            "VerifiedControlCommand",
+        ),
+        ".control",
+    ),
+    **dict.fromkeys(
+        (
+            "monitor_async_performance",
+            "monitor_calls",
+            "monitor_execution_time",
+            "monitor_performance",
+        ),
+        ".decorators",
+    ),
+    **dict.fromkeys(
+        (
+            "ElasticsearchClient",
+            "ELKIntegration",
+            "LogstashHandler",
+            "get_elk_integration",
+            "setup_elk_integration",
+            "shutdown_elk_integration",
+        ),
+        ".elk",
+    ),
+    **dict.fromkeys(
+        (
+            "ExchangeHealthMonitor",
+            "ExchangeHealthSummary",
+            "HealthCheck",
+            "HealthCheckFactory",
+            "HealthCheckResult",
+            "HealthStatus",
+        ),
+        ".exchange_health",
+    ),
+    **dict.fromkeys(
+        (
+            "EconomicFactReadModel",
+            "FactCursorError",
+            "FactPage",
+            "FactReadError",
+            "FactRecord",
+            "export_fact_page",
+        ),
+        ".facts",
+    ),
+    **dict.fromkeys(
+        (
+            "GrafanaDashboardBuilder",
+            "create_exchange_dashboard",
+            "create_system_dashboard",
+            "create_trading_dashboard",
+            "get_all_dashboard_configs",
+            "save_dashboard_to_file",
+        ),
+        ".grafana",
+    ),
+    **dict.fromkeys(
+        (
+            "CONTROL_COMMAND_HMAC_DOMAIN",
+            "ControlIssuerPolicy",
+            "ControlIssuerPolicyResolver",
+            "ControlKeyResolver",
+            "ControlScopeGrant",
+            "HmacControlCommandVerifier",
+            "HmacControlKey",
+        ),
+        ".ingress",
+    ),
+    **dict.fromkeys(
+        (
+            "Counter",
+            "Gauge",
+            "Histogram",
+            "MetricRegistry",
+            "PerformanceTimer",
+            "counter",
+            "gauge",
+            "get_registry",
+            "histogram",
+            "timer",
+        ),
+        ".metrics",
+    ),
+    **dict.fromkeys(
+        (
+            "PrometheusExporter",
+            "get_prometheus_exporter",
+            "start_prometheus_exporter",
+            "stop_prometheus_exporter",
+        ),
+        ".prometheus",
+    ),
+    **dict.fromkeys(
+        (
+            "EVENT_READ_HMAC_DOMAIN",
+            "MAX_EVENT_READ_PAGE_SIZE",
+            "EventReadAuthenticationError",
+            "EventReadCursorError",
+            "EventReadError",
+            "EventReadItemV1",
+            "EventReadPageV1",
+            "EventReadReplayError",
+            "EventReadRequestV1",
+            "ReadOnlyEventService",
+            "sign_event_read_request",
+            "verify_event_read_page",
+        ),
+        ".readonly_events",
+    ),
+    **dict.fromkeys(
+        (
+            "BusinessMetricsCollector",
+            "SystemMetrics",
+            "SystemMetricsCollector",
+            "get_business_collector",
+            "get_system_collector",
+        ),
+        ".system_metrics",
+    ),
+    "get_logger": "bt_api_base.logging_factory",
+}
 
 __all__ = [
     # Core monitoring
@@ -242,3 +284,24 @@ __all__ = [
     "get_all_dashboard_configs",
     "get_logger",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Import and cache one explicitly requested public object."""
+
+    module_name = _EXPORT_MODULES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    if module_name.startswith("."):
+        module = import_module(module_name, __name__)
+    else:
+        module = import_module(module_name)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Keep lazy public objects discoverable through ``dir()``."""
+
+    return sorted(set(globals()).union(__all__))
