@@ -97,6 +97,52 @@ start_prometheus_exporter(port=9090)
 
 ## API Reference
 
+### Optional ordinary strategy telemetry
+
+The explicit `telemetry_ingress` role receives best-effort heartbeats and flat
+numeric metrics through `telemetry.append`, and exposes authorized current
+observations through `telemetry.snapshot`. It uses bounded memory and has no
+outbox, worker thread or provider connection. A restart loses these ordinary
+observations; they are collected again from producers.
+
+```yaml
+components:
+  monitor:
+    config_schema_version: 2
+    settings:
+      instance_id: monitor-telemetry
+      bind_ports: [service.telemetry_ingress, service.monitor_query]
+      options:
+        role: telemetry_ingress
+        max_streams: 256
+        max_bytes: 1048576
+        heartbeat_timeout_seconds: 30
+        retention_seconds: 300
+```
+
+The trusted resource provider supplies `targets: frozenset[WireScope]`.
+Registry authentication and grants determine producer identity and scope;
+neither can be supplied in the sample body. Query results retain the trusted
+producer and run metadata and are filtered to the authorized scope.
+
+SDK strategies use `ServiceTelemetryEmitter` with an optional
+`runtime.telemetry` binding. Its queue has separate count and encoded-byte
+limits; overflow and failed deliveries increment reported drop counters.
+Enqueue performs no network I/O. The caller flushes on the runtime's owner
+thread, with a bounded RPC timeout; failed samples are dropped without retry.
+The emitter borrows the runtime and does not close it or create a scheduler.
+Calls to flush still perform synchronous network I/O and should be scheduled
+outside a latency-critical trading callback.
+
+No heartbeat means `not_collected`; metrics alone do not imply health.
+Heartbeat freshness uses the service's monotonic receipt time. Exact duplicate
+samples do not extend it. `fresh` proves a recently received heartbeat, rather
+than account connectivity or readiness to trade. Record-count and retained
+logical-byte limits apply before an update; expired streams free capacity.
+Snapshots also respect the transport's reply budget and fail explicitly when
+the authorized result cannot fit. Larger deployments must size these limits
+or use a future paginated query interface.
+
 ### Durable event delivery and control ingress
 
 `OutboxEvent` accepts redacted JSON facts. `DurableOutbox` stores them in SQLite
