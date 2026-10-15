@@ -609,6 +609,73 @@ def test_legacy_unverified_pending_commands_are_quarantined_on_schema_upgrade(tm
     assert ledger.claim_next("account:1", "owner") is None
 
 
+def test_legacy_pending_and_claimed_resume_are_quarantined_without_target_cause(tmp_path) -> None:
+    database = tmp_path / "legacy-resume.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE monitor_control_commands (
+                command_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+                account_id TEXT NOT NULL, mode TEXT NOT NULL, scope TEXT NOT NULL,
+                action TEXT NOT NULL, issuer TEXT NOT NULL, key_id TEXT NOT NULL,
+                reason TEXT NOT NULL, receipt_digest TEXT NOT NULL,
+                issued_at REAL NOT NULL, expires_at REAL NOT NULL,
+                manual_resume_authorized INTEGER NOT NULL, issuer_sequence INTEGER,
+                envelope_digest TEXT, verification_digest TEXT, status TEXT NOT NULL,
+                executor_id TEXT, outcome TEXT, updated_at REAL NOT NULL
+            )
+            """
+        )
+        legacy_fields = (
+            "command_id, fingerprint, account_id, mode, scope, action, issuer, key_id, "
+            "reason, receipt_digest, issued_at, expires_at, manual_resume_authorized, "
+            "issuer_sequence, envelope_digest, verification_digest, status, executor_id, "
+            "outcome, updated_at"
+        )
+        connection.executemany(
+            f"INSERT INTO monitor_control_commands ({legacy_fields}) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    command_id,
+                    command_id + "-fingerprint",
+                    "account-id-1",
+                    "simulation",
+                    "account:1",
+                    "resume",
+                    "monitor",
+                    "unit-test-key",
+                    "legacy resume",
+                    "a" * 64,
+                    1_700_000_000.0,
+                    1_700_000_100.0,
+                    1,
+                    sequence,
+                    ("b" if sequence == 1 else "c") * 64,
+                    ("d" if sequence == 1 else "e") * 64,
+                    status,
+                    executor,
+                    None,
+                    1_700_000_000.0,
+                )
+                for command_id, sequence, status, executor in (
+                    ("legacy-pending-resume", 1, "pending", None),
+                    ("legacy-claimed-resume", 2, "claimed", "monitor-owner"),
+                )
+            ],
+        )
+
+    ledger = DurableControlLedger(database, clock=MutableClock())
+
+    for command_id in ("legacy-pending-resume", "legacy-claimed-resume"):
+        row = ledger.get(command_id)
+        assert row.status is ControlStatus.UNKNOWN
+        assert row.outcome == "legacy_resume_target_cause_unavailable"
+        assert row.command.schema_version == 1
+        assert row.command.target_freeze_cause_id is None
+    assert ledger.claim_next("account:1", "monitor-owner") is None
+
+
 def test_resume_requires_manual_authorization_and_commands_expire(tmp_path) -> None:
     clock = MutableClock()
     ledger = DurableControlLedger(tmp_path / "monitor.db", clock=clock)

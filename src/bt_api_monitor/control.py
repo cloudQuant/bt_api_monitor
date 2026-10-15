@@ -15,11 +15,12 @@ import math
 import re
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Callable, Optional, Protocol, Union
 
 
@@ -107,6 +108,7 @@ class ControlCommandBinding:
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MONITOR_FREEZE_CAUSE_RE = re.compile(r"^monitor-freeze-v1:[0-9a-f]{64}$")
 _CONTROL_ENVELOPE_DOMAIN = b"bt-api-monitor-control-envelope-v1\0"
 _INGRESS_PROOF = object()
 _MAX_CONTROL_PAYLOAD_BYTES = 64 * 1024
@@ -172,6 +174,8 @@ class VerifiedControlCommand:
     manual_resume_authorized: bool
     envelope_digest: str
     verification_digest: str
+    schema_version: int = 1
+    target_freeze_cause_id: str | None = None
 
     def __post_init__(self) -> None:
         _validated_command(
@@ -187,6 +191,8 @@ class VerifiedControlCommand:
             issued_at=self.issued_at,
             expires_at=self.expires_at,
             manual_resume_authorized=self.manual_resume_authorized,
+            schema_version=self.schema_version,
+            target_freeze_cause_id=self.target_freeze_cause_id,
             require_receipt_digest=True,
         )
         if type(self.issuer_sequence) is not int or self.issuer_sequence <= 0:
@@ -218,12 +224,27 @@ def _validated_command(
     issued_at: float,
     expires_at: float,
     manual_resume_authorized: bool,
+    schema_version: int = 1,
+    target_freeze_cause_id: str | None = None,
     require_receipt_digest: bool = False,
 ) -> None:
     if not isinstance(action, ControlAction):
         raise ValueError("action must be a ControlAction")
     if type(manual_resume_authorized) is not bool:
         raise ValueError("manual_resume_authorized must be a boolean")
+    if type(schema_version) is not int or schema_version not in (1, 2):
+        raise ValueError("schema_version must be 1 or 2")
+    if target_freeze_cause_id is not None and (
+        type(target_freeze_cause_id) is not str
+        or _MONITOR_FREEZE_CAUSE_RE.fullmatch(target_freeze_cause_id) is None
+    ):
+        raise ValueError("target_freeze_cause_id is invalid")
+    if schema_version == 1 and target_freeze_cause_id is not None:
+        raise ValueError("schema version 1 cannot name a target freeze cause")
+    if schema_version == 2 and action is ControlAction.RESUME and target_freeze_cause_id is None:
+        raise ValueError("schema version 2 resume requires an exact target freeze cause")
+    if schema_version == 2 and action is not ControlAction.RESUME and target_freeze_cause_id is not None:
+        raise ValueError("only resume may name a target freeze cause")
     for name, value in (
         ("command_id", command_id),
         ("account_id", account_id),
@@ -268,6 +289,8 @@ class ControlCommand:
     issued_at: float
     expires_at: float
     manual_resume_authorized: bool = False
+    schema_version: int = 1
+    target_freeze_cause_id: str | None = None
 
     def __post_init__(self) -> None:
         _validated_command(
@@ -283,27 +306,95 @@ class ControlCommand:
             issued_at=self.issued_at,
             expires_at=self.expires_at,
             manual_resume_authorized=self.manual_resume_authorized,
+            schema_version=self.schema_version,
+            target_freeze_cause_id=self.target_freeze_cause_id,
         )
 
     @property
     def fingerprint(self) -> str:
-        return _sha256(
-            _canonical_json(
-                {
-                    "action": self.action.value,
-                    "account_id": self.account_id,
-                    "expires_at": self.expires_at,
-                    "issued_at": self.issued_at,
-                    "issuer": self.issuer,
-                    "key_id": self.key_id,
-                    "manual_resume_authorized": self.manual_resume_authorized,
-                    "mode": self.mode,
-                    "reason": self.reason,
-                    "receipt_digest": self.receipt_digest,
-                    "scope": self.scope,
-                }
-            )
-        )
+        values: dict[str, object] = {
+            "action": self.action.value,
+            "account_id": self.account_id,
+            "expires_at": self.expires_at,
+            "issued_at": self.issued_at,
+            "issuer": self.issuer,
+            "key_id": self.key_id,
+            "manual_resume_authorized": self.manual_resume_authorized,
+            "mode": self.mode,
+            "reason": self.reason,
+            "receipt_digest": self.receipt_digest,
+            "scope": self.scope,
+        }
+        # Preserve the original v1 fingerprint so exact historical retries
+        # remain idempotent after a ledger is opened by this version.
+        if self.schema_version >= 2:
+            values["schema_version"] = self.schema_version
+            values["target_freeze_cause_id"] = self.target_freeze_cause_id
+        return _sha256(_canonical_json(values))
+
+
+def monitor_freeze_cause_id(command: ControlCommand) -> str:
+    """Return the stable Risk cause identifier produced by one verified FREEZE.
+
+    The account, mode and command scope are included so a cause id cannot be
+    reused across a different monitor route. This function only derives an
+    identifier; Risk remains the authority for whether a cause exists or is
+    active.
+    """
+
+    if type(command) is not ControlCommand or command.action is not ControlAction.FREEZE:
+        raise ValueError("a verified FREEZE command is required")
+    facts = {
+        "account_id": command.account_id,
+        "command_id": command.command_id,
+        "issuer": command.issuer,
+        "mode": command.mode,
+        "schema": "bt-api-monitor-freeze-cause-v1",
+        "scope": command.scope,
+    }
+    digest = hashlib.sha256(_canonical_json(facts).encode("utf-8")).hexdigest()
+    return "monitor-freeze-v1:" + digest
+
+
+def _encode_effect_result(value: Mapping[str, object] | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or any(type(key) is not str for key in value):
+        raise ValueError("effect_result must be a flat string-keyed mapping")
+    copied: dict[str, object] = {}
+    for key, item in value.items():
+        if not key or key != key.strip() or type(item) not in (str, bool, int, type(None)):
+            raise ValueError("effect_result contains an unsupported value")
+        if type(item) is str and len(item.encode("utf-8", errors="strict")) > 256:
+            raise ValueError("effect_result text is too long")
+        copied[key] = item
+    encoded = _canonical_json(copied)
+    if len(encoded.encode("utf-8")) > 4096:
+        raise ValueError("effect_result is too large")
+    return encoded
+
+
+def _decode_effect_result(value: object) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if type(value) is not str or len(value.encode("utf-8", errors="strict")) > 4096:
+        raise ValueError("persisted effect_result is malformed")
+    try:
+        decoded = json.loads(value, object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+        raise ValueError("persisted effect_result is malformed") from None
+    if type(decoded) is not dict or _encode_effect_result(decoded) != value:
+        raise ValueError("persisted effect_result is malformed")
+    return MappingProxyType(decoded)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
 
 
 @dataclass(frozen=True, repr=False)
@@ -350,6 +441,8 @@ class ClaimedControlCommand:
     status: ControlStatus
     executor_id: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
     outcome: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    effect_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    effect_result: Optional[Mapping[str, object]] = None  # noqa: UP045 -- Python 3.9 is supported.
 
 
 class DurableControlLedger:
@@ -404,14 +497,22 @@ class DurableControlLedger:
                 else ControlStatus.PENDING
             )
             outcome = "command_ttl_elapsed" if status is ControlStatus.EXPIRED else None
+            ledger_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(ledger_sequence), 0) + 1 "
+                    "FROM monitor_control_commands"
+                ).fetchone()[0]
+            )
             connection.execute(
                 """
                 INSERT INTO monitor_control_commands (
                     command_id, fingerprint, account_id, mode, scope, action, issuer, key_id,
                     reason, receipt_digest,
                     issued_at, expires_at, manual_resume_authorized, issuer_sequence,
-                    envelope_digest, verification_digest, status, executor_id, outcome, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                    envelope_digest, verification_digest, schema_version,
+                    target_freeze_cause_id, effect_ref, status, executor_id, outcome, updated_at,
+                    ledger_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?)
                 """,
                 (
                     durable_command.command_id,
@@ -430,12 +531,94 @@ class DurableControlLedger:
                     accepted.issuer_sequence,
                     accepted.envelope_digest,
                     accepted.verification_digest,
+                    durable_command.schema_version,
+                    durable_command.target_freeze_cause_id,
                     status.value,
                     outcome,
                     now,
+                    ledger_sequence,
                 ),
             )
             return ClaimedControlCommand(durable_command, status, None)
+
+    def claim_command(
+        self,
+        command_id: str,
+        scope: str,
+        executor_id: str,
+        *,
+        account_id: str,
+        mode: str,
+    ) -> Optional[ClaimedControlCommand]:  # noqa: UP045 -- Python 3.9 is supported.
+        """Claim the exact next command, or recover its v2 UNKNOWN effect.
+
+        A recovery stays bound to the executor that made the original claim.
+        Commands are serialized per account/mode/scope so an uncertain earlier
+        FREEZE cannot be replayed after a later RESUME has already completed.
+        """
+
+        for value in (command_id, scope, executor_id, account_id, mode):
+            if type(value) is not str or not value.strip() or value != value.strip():
+                raise ValueError("command and owner route values are required")
+        now = self._clock()
+        with self._transaction() as connection:
+            self._expire_pending(connection, now)
+            row = connection.execute(
+                """
+                SELECT * FROM monitor_control_commands
+                WHERE command_id = ? AND scope = ? AND account_id = ? AND mode = ?
+                    AND status IN (?, ?) AND issued_at <= ?
+                    AND issuer_sequence IS NOT NULL
+                    AND key_id IS NOT NULL AND key_id <> ''
+                    AND envelope_digest IS NOT NULL AND envelope_digest <> ''
+                    AND verification_digest IS NOT NULL AND verification_digest <> ''
+                """,
+                (
+                    command_id,
+                    scope,
+                    account_id,
+                    mode,
+                    ControlStatus.PENDING.value,
+                    ControlStatus.UNKNOWN.value,
+                    now,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            status = ControlStatus(str(row["status"]))
+            if status is ControlStatus.PENDING and float(row["expires_at"]) <= now:
+                return None
+            if status is ControlStatus.UNKNOWN and (
+                row["executor_id"] != executor_id
+                or int(row["schema_version"] or 1) < 2
+            ):
+                return None
+            if self._has_earlier_unresolved(connection, row):
+                return None
+            updated = connection.execute(
+                """
+                UPDATE monitor_control_commands
+                SET status = ?, executor_id = ?, outcome = NULL, effect_ref = NULL,
+                    effect_result = NULL, updated_at = ?
+                WHERE command_id = ? AND status = ?
+                """,
+                (
+                    ControlStatus.CLAIMED.value,
+                    executor_id,
+                    now,
+                    command_id,
+                    status.value,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            claimed = dict(row)
+            claimed["status"] = ControlStatus.CLAIMED.value
+            claimed["executor_id"] = executor_id
+            claimed["outcome"] = None
+            claimed["effect_ref"] = None
+            claimed["effect_result"] = None
+            return self._claimed_from_mapping(claimed)
 
     def claim_next(
         self,
@@ -445,7 +628,12 @@ class DurableControlLedger:
         account_id: str | None = None,
         mode: str | None = None,
     ) -> Optional[ClaimedControlCommand]:  # noqa: UP045 -- Python 3.9 is supported.
-        """Lease the oldest pending unexpired command in the requested scope."""
+        """Lease the oldest command or recover its exact v2 UNKNOWN effect.
+
+        An unresolved older command blocks all later commands for the same
+        account, mode and scope. An UNKNOWN v1 RESUME has no cause identity and
+        is deliberately not replayable.
+        """
         if (
             type(scope) is not str
             or not scope.strip()
@@ -468,7 +656,7 @@ class DurableControlLedger:
             row = connection.execute(
                 """
                 SELECT * FROM monitor_control_commands
-                WHERE scope = ? AND status = ? AND issued_at <= ?
+                WHERE scope = ? AND status IN (?, ?) AND issued_at <= ?
                     AND issuer_sequence IS NOT NULL
                     AND account_id IS NOT NULL AND account_id <> ''
                     AND mode IS NOT NULL AND mode <> ''
@@ -477,11 +665,12 @@ class DurableControlLedger:
                     AND verification_digest IS NOT NULL AND verification_digest <> ''
                     AND (? IS NULL OR account_id = ?)
                     AND (? IS NULL OR mode = ?)
-                ORDER BY issued_at ASC, command_id ASC LIMIT 1
+                ORDER BY ledger_sequence ASC LIMIT 1
                 """,
                 (
                     scope,
                     ControlStatus.PENDING.value,
+                    ControlStatus.UNKNOWN.value,
                     now,
                     account_id,
                     account_id,
@@ -491,17 +680,62 @@ class DurableControlLedger:
             ).fetchone()
             if row is None:
                 return None
-            connection.execute(
+            status = ControlStatus(str(row["status"]))
+            if status is ControlStatus.UNKNOWN and (
+                row["executor_id"] != executor_id
+                or int(row["schema_version"] or 1) < 2
+            ):
+                return None
+            if self._has_earlier_unresolved(connection, row):
+                return None
+            updated = connection.execute(
                 """
                 UPDATE monitor_control_commands
-                SET status = ?, executor_id = ?, updated_at = ? WHERE command_id = ?
+                SET status = ?, executor_id = ?, outcome = NULL, effect_ref = NULL,
+                    effect_result = NULL, updated_at = ?
+                WHERE command_id = ? AND status = ?
                 """,
-                (ControlStatus.CLAIMED.value, executor_id, now, row["command_id"]),
+                (
+                    ControlStatus.CLAIMED.value,
+                    executor_id,
+                    now,
+                    row["command_id"],
+                    status.value,
+                ),
             )
+            if updated.rowcount != 1:
+                return None
             claimed = dict(row)
             claimed["status"] = ControlStatus.CLAIMED.value
             claimed["executor_id"] = executor_id
+            claimed["outcome"] = None
+            claimed["effect_ref"] = None
+            claimed["effect_result"] = None
             return self._claimed_from_mapping(claimed)
+
+    @staticmethod
+    def _has_earlier_unresolved(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> bool:
+        earlier = connection.execute(
+            """
+            SELECT 1 FROM monitor_control_commands
+            WHERE scope = ? AND account_id = ? AND mode = ?
+                AND status IN (?, ?, ?)
+                AND ledger_sequence < ?
+            LIMIT 1
+            """,
+            (
+                str(row["scope"]),
+                str(row["account_id"]),
+                str(row["mode"]),
+                ControlStatus.PENDING.value,
+                ControlStatus.CLAIMED.value,
+                ControlStatus.UNKNOWN.value,
+                int(row["ledger_sequence"]),
+            ),
+        ).fetchone()
+        return earlier is not None
 
     def finish(self, command_id: str, executor_id: str, succeeded: bool, outcome: str) -> None:
         """Record a final owner outcome after the external action has actually completed."""
@@ -521,6 +755,8 @@ class DurableControlLedger:
                 failure = ControlClaimError("command does not exist")
             elif row["executor_id"] != executor_id:
                 failure = ControlClaimError("command is owned by another executor")
+            elif int(row["schema_version"] or 1) >= 2:
+                failure = ControlClaimError("typed owner outcome is required for schema v2")
             elif row["status"] == status.value and row["outcome"] == outcome:
                 return
             elif row["status"] != ControlStatus.CLAIMED.value:
@@ -540,7 +776,13 @@ class DurableControlLedger:
             raise failure
 
     def finish_owner_outcome(
-        self, command_id: str, executor_id: str, outcome: ControlOwnerOutcome
+        self,
+        command_id: str,
+        executor_id: str,
+        outcome: ControlOwnerOutcome,
+        *,
+        effect_ref: str | None = None,
+        effect_result: Mapping[str, object] | None = None,
     ) -> None:
         """Persist a finite owner result, keeping uncertain effects UNKNOWN.
 
@@ -558,6 +800,17 @@ class DurableControlLedger:
             raise ValueError("command_id and executor_id are required")
         if type(outcome) is not ControlOwnerOutcome:
             raise ValueError("a ControlOwnerOutcome is required")
+        if effect_ref is not None and (
+            type(effect_ref) is not str
+            or not effect_ref
+            or effect_ref != effect_ref.strip()
+        ):
+            raise ValueError("effect_ref must be trimmed non-empty text")
+        encoded_effect_result = _encode_effect_result(effect_result)
+        if outcome is ControlOwnerOutcome.UNKNOWN and (
+            effect_ref is not None or encoded_effect_result is not None
+        ):
+            raise ValueError("unknown outcomes cannot assert an effect result")
         status = {
             ControlOwnerOutcome.APPLIED: ControlStatus.ACKNOWLEDGED,
             ControlOwnerOutcome.REJECTED: ControlStatus.REJECTED,
@@ -566,7 +819,12 @@ class DurableControlLedger:
         failure = None
         with self._transaction() as connection:
             now = self._clock()
-            self._expire_pending(connection, now)
+            # A v2 UNKNOWN can be reclaimed after the original signed command
+            # expires. Once that recovery claim is in flight, its final Risk
+            # result must be allowed to persist even though the command's
+            # original expires_at remains in the past. Keep expiring all
+            # unrelated stale rows while excluding this exact finalization.
+            self._expire_pending(connection, now, exclude_claimed_command_id=command_id)
             row = connection.execute(
                 "SELECT * FROM monitor_control_commands WHERE command_id = ?", (command_id,)
             ).fetchone()
@@ -574,7 +832,12 @@ class DurableControlLedger:
                 failure = ControlClaimError("command does not exist")
             elif row["executor_id"] != executor_id:
                 failure = ControlClaimError("command is owned by another executor")
-            elif row["status"] == status.value and row["outcome"] == outcome.value:
+            elif (
+                row["status"] == status.value
+                and row["outcome"] == outcome.value
+                and row["effect_ref"] == effect_ref
+                and row["effect_result"] == encoded_effect_result
+            ):
                 return
             elif row["status"] != ControlStatus.CLAIMED.value:
                 failure = ControlClaimError(
@@ -583,10 +846,18 @@ class DurableControlLedger:
             else:
                 connection.execute(
                     """
-                    UPDATE monitor_control_commands SET status = ?, outcome = ?, updated_at = ?
+                    UPDATE monitor_control_commands
+                    SET status = ?, outcome = ?, effect_ref = ?, effect_result = ?, updated_at = ?
                     WHERE command_id = ?
                     """,
-                    (status.value, outcome.value, now, command_id),
+                    (
+                        status.value,
+                        outcome.value,
+                        effect_ref,
+                        encoded_effect_result,
+                        now,
+                        command_id,
+                    ),
                 )
         if failure is not None:
             raise failure
@@ -599,7 +870,13 @@ class DurableControlLedger:
             ).fetchone()
         return self._claimed_from_row(row) if row is not None else None
 
-    def _expire_pending(self, connection: sqlite3.Connection, now: float) -> None:
+    def _expire_pending(
+        self,
+        connection: sqlite3.Connection,
+        now: float,
+        *,
+        exclude_claimed_command_id: str | None = None,
+    ) -> None:
         connection.execute(
             """
             UPDATE monitor_control_commands
@@ -618,6 +895,7 @@ class DurableControlLedger:
             """
             UPDATE monitor_control_commands SET status = ?, outcome = ?, updated_at = ?
             WHERE status = ? AND expires_at <= ?
+                AND (? IS NULL OR command_id <> ?)
             """,
             (
                 ControlStatus.UNKNOWN.value,
@@ -625,6 +903,8 @@ class DurableControlLedger:
                 now,
                 ControlStatus.CLAIMED.value,
                 now,
+                exclude_claimed_command_id,
+                exclude_claimed_command_id,
             ),
         )
 
@@ -645,6 +925,12 @@ class DurableControlLedger:
             issued_at=_persisted_timestamp("issued_at", row["issued_at"]),
             expires_at=_persisted_timestamp("expires_at", row["expires_at"]),
             manual_resume_authorized=bool(row["manual_resume_authorized"]),
+            schema_version=int(row.get("schema_version") or 1),
+            target_freeze_cause_id=(
+                str(row["target_freeze_cause_id"])
+                if row.get("target_freeze_cause_id") is not None
+                else None
+            ),
         )
         executor_id = row.get("executor_id")
         return ClaimedControlCommand(
@@ -652,6 +938,8 @@ class DurableControlLedger:
             status=ControlStatus(str(row["status"])),
             executor_id=str(executor_id) if executor_id is not None else None,
             outcome=str(row["outcome"]) if row.get("outcome") is not None else None,
+            effect_ref=str(row["effect_ref"]) if row.get("effect_ref") is not None else None,
+            effect_result=_decode_effect_result(row.get("effect_result")),
         )
 
     def _initialize_schema(self) -> None:
@@ -676,6 +964,11 @@ class DurableControlLedger:
                     issuer_sequence INTEGER,
                     envelope_digest TEXT,
                     verification_digest TEXT,
+                    schema_version INTEGER NOT NULL DEFAULT 1,
+                    target_freeze_cause_id TEXT,
+                    effect_ref TEXT,
+                    effect_result TEXT,
+                    ledger_sequence INTEGER,
                     status TEXT NOT NULL,
                     executor_id TEXT,
                     outcome TEXT,
@@ -696,6 +989,11 @@ class DurableControlLedger:
                 "issuer_sequence": "INTEGER",
                 "envelope_digest": "TEXT",
                 "verification_digest": "TEXT",
+                "schema_version": "INTEGER",
+                "target_freeze_cause_id": "TEXT",
+                "effect_ref": "TEXT",
+                "effect_result": "TEXT",
+                "ledger_sequence": "INTEGER",
             }
             for name, declaration in migrations.items():
                 if name not in columns:
@@ -705,6 +1003,17 @@ class DurableControlLedger:
                         + " "
                         + declaration
                     )
+            connection.execute(
+                "UPDATE monitor_control_commands SET schema_version = 1 WHERE schema_version IS NULL"
+            )
+            connection.execute(
+                "UPDATE monitor_control_commands SET ledger_sequence = rowid "
+                "WHERE ledger_sequence IS NULL"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_monitor_control_ledger_sequence "
+                "ON monitor_control_commands(ledger_sequence)"
+            )
             connection.execute(
                 """
                 UPDATE monitor_control_commands
@@ -721,6 +1030,22 @@ class DurableControlLedger:
                     "legacy_unverified_control_command_requires_reconciliation",
                     ControlStatus.PENDING.value,
                     ControlStatus.CLAIMED.value,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE monitor_control_commands
+                SET status = ?, outcome = ?
+                WHERE status IN (?, ?) AND action = ?
+                    AND (schema_version < 2 OR target_freeze_cause_id IS NULL
+                        OR target_freeze_cause_id = '')
+                """,
+                (
+                    ControlStatus.UNKNOWN.value,
+                    "legacy_resume_target_cause_unavailable",
+                    ControlStatus.PENDING.value,
+                    ControlStatus.CLAIMED.value,
+                    ControlAction.RESUME.value,
                 ),
             )
             connection.execute(
@@ -825,6 +1150,8 @@ class ControlIngress:
                 manual_resume_authorized=verified.manual_resume_authorized,
                 envelope_digest=verified.envelope_digest,
                 verification_digest=verified.verification_digest,
+                schema_version=verified.schema_version,
+                target_freeze_cause_id=verified.target_freeze_cause_id,
             )
         except Exception:
             raise ControlAuthorizationError("control_verification_failed") from None
@@ -853,6 +1180,8 @@ class ControlIngress:
             issued_at=verified.issued_at,
             expires_at=verified.expires_at,
             manual_resume_authorized=verified.manual_resume_authorized,
+            schema_version=verified.schema_version,
+            target_freeze_cause_id=verified.target_freeze_cause_id,
         )
         accepted = _IngressAcceptedCommand(
             command=command,
@@ -897,4 +1226,5 @@ __all__ = [
     "ControlStatus",
     "DurableControlLedger",
     "VerifiedControlCommand",
+    "monitor_freeze_cause_id",
 ]

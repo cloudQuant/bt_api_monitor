@@ -22,6 +22,7 @@ from bt_api_monitor import (
     DurableControlLedger,
     HmacControlCommandVerifier,
     HmacControlKey,
+    monitor_freeze_cause_id,
 )
 
 NOW = 1_700_000_000.0
@@ -125,6 +126,8 @@ def signed_envelope(**overrides: object) -> ControlCommandEnvelope:
         "manual_resume_authorized": False,
     }
     claims.update(overrides)
+    if claims["schema_version"] == 2 and "target_freeze_cause_id" not in claims:
+        claims["target_freeze_cause_id"] = None
     payload = json.dumps(
         claims,
         sort_keys=True,
@@ -153,6 +156,9 @@ def test_hmac_verifier_accepts_exact_signed_scope_and_persists_binding(tmp_path)
     assert accepted.command.account_id == ACCOUNT_ID
     assert accepted.command.mode == MODE
     assert accepted.command.key_id == KEY_ID
+    assert monitor_freeze_cause_id(accepted.command) == monitor_freeze_cause_id(
+        ledger.get("freeze-001").command
+    )
     assert ledger.claim_next(SCOPE, "offline-test-owner").command == accepted.command
 
 
@@ -247,8 +253,10 @@ def test_issuer_action_receipt_and_resume_permissions_are_exact() -> None:
 
     resume = signed_envelope(
         command_id="resume-001",
+        schema_version=2,
         action=ControlAction.RESUME.value,
         manual_resume_authorized=True,
+        target_freeze_cause_id="monitor-freeze-v1:" + "c" * 64,
         issuer_sequence=2,
     )
     resume_policy = make_policy(
@@ -261,6 +269,63 @@ def test_issuer_action_receipt_and_resume_permissions_are_exact() -> None:
             verifier(policy=resume_policy),
             clock=MutableClock(),
         ).submit(resume)
+
+
+def test_v1_resume_is_explicitly_rejected_and_v2_binds_exact_target(tmp_path) -> None:
+    resume_policy = make_policy(
+        actions=(ControlAction.FREEZE, ControlAction.RESUME),
+        manual_resume_allowed=True,
+    )
+    ledger = DurableControlLedger(tmp_path / "resume-v2.sqlite", clock=MutableClock())
+    ingress = ControlIngress(ledger, verifier(policy=resume_policy), clock=MutableClock())
+
+    with pytest.raises(ControlAuthorizationError, match="verification failed"):
+        ingress.submit(
+            signed_envelope(
+                command_id="legacy-resume",
+                action=ControlAction.RESUME.value,
+                manual_resume_authorized=True,
+            )
+        )
+    assert ledger.get("legacy-resume") is None
+
+    target = "monitor-freeze-v1:" + "d" * 64
+    accepted = ingress.submit(
+        signed_envelope(
+            command_id="resume-v2",
+            schema_version=2,
+            action=ControlAction.RESUME.value,
+            manual_resume_authorized=True,
+            target_freeze_cause_id=target,
+        )
+    )
+    assert accepted.command.schema_version == 2
+    assert accepted.command.target_freeze_cause_id == target
+
+
+@pytest.mark.parametrize(
+    "target, expected_code",
+    [
+        (None, "control resume target cause invalid"),
+        ("dispatch-inflight:intent-1", "control resume target cause invalid"),
+        ("monitor-freeze-v1:" + "A" * 64, "control resume target cause invalid"),
+    ],
+)
+def test_v2_resume_requires_a_monitor_freeze_target(target: object, expected_code: str) -> None:
+    envelope = signed_envelope(
+        command_id="resume-v2-invalid",
+        schema_version=2,
+        action=ControlAction.RESUME.value,
+        manual_resume_authorized=True,
+        target_freeze_cause_id=target,
+    )
+    with pytest.raises(ControlAuthorizationError, match=expected_code):
+        verifier(
+            policy=make_policy(
+                actions=(ControlAction.FREEZE, ControlAction.RESUME),
+                manual_resume_allowed=True,
+            )
+        ).verify(envelope, now_utc=NOW)
 
 
 @pytest.mark.parametrize(

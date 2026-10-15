@@ -58,6 +58,7 @@ _EXPORT_MODULES = {
             "ControlStatus",
             "DurableControlLedger",
             "VerifiedControlCommand",
+            "monitor_freeze_cause_id",
         ),
         ".control",
     ),

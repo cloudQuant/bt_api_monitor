@@ -20,8 +20,10 @@ from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from .control import (
     ClaimedControlCommand,
+    ControlAction,
     ControlAuthorizationError,
     ControlClaimError,
+    ControlCommand,
     ControlCommandBinding,
     ControlCommandEnvelope,
     ControlConflictError,
@@ -29,6 +31,7 @@ from .control import (
     ControlOwnerOutcome,
     ControlStatus,
     DurableControlLedger,
+    monitor_freeze_cause_id,
 )
 from .service_component import (
     MonitorReadServiceError,
@@ -51,8 +54,10 @@ MONITOR_CONTROL_PUBLIC_PORT = "service.monitor_control"
 MONITOR_CONTROL_OWNER_PORT = "service.owner_control"
 _CONTROL_OPTIONS = frozenset({"role"})
 _SUBMIT_FIELDS = frozenset({"schema_version", "payload_b64", "signature_b64"})
-_CLAIM_FIELDS = frozenset({"schema_version"})
-_ACKNOWLEDGE_FIELDS = frozenset({"schema_version", "command_id", "outcome"})
+_CLAIM_FIELDS_V1 = frozenset({"schema_version"})
+_CLAIM_FIELDS_V2 = frozenset({"schema_version", "command_id"})
+_ACKNOWLEDGE_FIELDS_V1 = frozenset({"schema_version", "command_id", "outcome"})
+_ACKNOWLEDGE_FIELDS_V2 = _ACKNOWLEDGE_FIELDS_V1.union({"effect_ref", "effect_result"})
 _MAX_CONTROL_PAYLOAD_BYTES = 64 * 1024
 _MAX_CONTROL_SIGNATURE_BYTES = 16 * 1024
 _MAX_PAYLOAD_B64_CHARS = ((_MAX_CONTROL_PAYLOAD_BYTES + 2) // 3) * 4
@@ -181,6 +186,12 @@ class MonitorControlService:
                     raise MonitorControlServiceError("AMBIGUOUS_TARGET")
         self._targets = MappingProxyType(copied)
 
+    @property
+    def route_targets(self) -> Mapping[WireScope, MonitorControlTarget]:
+        """Return the immutable code-owned route table to trusted adapters."""
+
+        return self._targets
+
     def handle(
         self,
         operation: str,
@@ -235,14 +246,27 @@ class MonitorControlService:
     def _claim(
         self, target: MonitorControlTarget, arguments: Mapping[str, Any]
     ) -> Mapping[str, Any]:
-        _parse_empty_operation(arguments, _CLAIM_FIELDS)
+        version = _operation_schema_version(arguments)
         try:
-            claimed = target.ingress.ledger.claim_next(
-                target.command_scope,
-                target.executor_id,
-                account_id=target.account_id,
-                mode=target.mode,
-            )
+            if version == 1:
+                _parse_fields(arguments, _CLAIM_FIELDS_V1)
+                claimed = target.ingress.ledger.claim_next(
+                    target.command_scope,
+                    target.executor_id,
+                    account_id=target.account_id,
+                    mode=target.mode,
+                )
+            else:
+                values = _parse_fields(arguments, _CLAIM_FIELDS_V2)
+                command_id = values["command_id"]
+                _validate_text(command_id, "INVALID_COMMAND_ID")
+                claimed = target.ingress.ledger.claim_command(
+                    command_id,
+                    target.command_scope,
+                    target.executor_id,
+                    account_id=target.account_id,
+                    mode=target.mode,
+                )
         except Exception:
             raise MonitorControlServiceError("CONTROL_CLAIM_FAILED") from None
         if claimed is None:
@@ -255,7 +279,7 @@ class MonitorControlService:
     def _acknowledge(
         self, target: MonitorControlTarget, arguments: Mapping[str, Any]
     ) -> Mapping[str, Any]:
-        command_id, outcome = _parse_owner_outcome(arguments)
+        command_id, outcome, effect_ref, effect_result = _parse_owner_outcome(arguments)
         try:
             current = target.ingress.ledger.get(command_id)
         except Exception:
@@ -263,9 +287,15 @@ class MonitorControlService:
         if current is None:
             raise MonitorControlServiceError("COMMAND_NOT_FOUND")
         _validate_ledger_result(current, target, expected_executor=target.executor_id)
+        if _operation_schema_version(arguments) == 2:
+            _validate_owner_effect(current.command, outcome, effect_ref, effect_result)
         try:
             target.ingress.ledger.finish_owner_outcome(
-                command_id, target.executor_id, outcome
+                command_id,
+                target.executor_id,
+                outcome,
+                effect_ref=effect_ref,
+                effect_result=effect_result,
             )
             result = target.ingress.ledger.get(command_id)
         except ControlClaimError:
@@ -292,6 +322,31 @@ class MonitorControlService:
         if len(matches) != 1:
             raise MonitorControlServiceError("SCOPE_NOT_GRANTED")
         return matches[0]
+
+    def target_for_scope(self, scope: WireScope) -> MonitorControlTarget:
+        """Return the fixed trusted route selected by this exact wire scope.
+
+        This in-process accessor is for the SDK's trusted owner composition;
+        it does not expose a service operation or wire capability.
+        """
+
+        return self._resolve_target(scope)
+
+    def get_command_status(
+        self, command_id: str, *, scope: WireScope
+    ) -> Mapping[str, Any]:
+        """Project one persisted row for the exact trusted control route."""
+
+        _validate_text(command_id, "INVALID_COMMAND_ID")
+        target = self._resolve_target(scope)
+        try:
+            result = target.ingress.ledger.get(command_id)
+        except Exception:
+            raise MonitorControlServiceError("CONTROL_STATUS_READ_FAILED") from None
+        if result is None:
+            raise MonitorControlServiceError("COMMAND_NOT_FOUND")
+        _validate_ledger_result(result, target, expected_executor=None)
+        return _command_status(result)
 
 
 def validate_service_options(
@@ -359,11 +414,19 @@ def _parse_empty_operation(
     return values
 
 
+def _require_schema_v1(arguments: Mapping[str, Any]) -> None:
+    if type(arguments["schema_version"]) is not int or arguments["schema_version"] != 1:
+        raise MonitorControlServiceError("UNSUPPORTED_SCHEMA_VERSION")
+
+
 def _parse_owner_outcome(
     arguments: Mapping[str, Any],
-) -> tuple[str, ControlOwnerOutcome]:
-    values = _parse_fields(arguments, _ACKNOWLEDGE_FIELDS)
-    _require_schema_v1(values)
+) -> tuple[str, ControlOwnerOutcome, str | None, Mapping[str, object] | None]:
+    version = _operation_schema_version(arguments)
+    if version == 1:
+        values = _parse_fields(arguments, _ACKNOWLEDGE_FIELDS_V1)
+    else:
+        values = _parse_fields(arguments, _ACKNOWLEDGE_FIELDS_V2)
     command_id = values["command_id"]
     _validate_text(command_id, "INVALID_COMMAND_ID")
     raw_outcome = values["outcome"]
@@ -373,7 +436,27 @@ def _parse_owner_outcome(
         outcome = ControlOwnerOutcome(raw_outcome)
     except ValueError:
         raise MonitorControlServiceError("INVALID_OWNER_OUTCOME") from None
-    return command_id, outcome
+    effect_ref = values.get("effect_ref")
+    effect_result = values.get("effect_result")
+    if version == 2:
+        if outcome is ControlOwnerOutcome.APPLIED:
+            _validate_text(effect_ref, "INVALID_EFFECT_REFERENCE")
+        elif effect_ref is not None:
+            raise MonitorControlServiceError("INVALID_EFFECT_REFERENCE")
+        if effect_result is not None:
+            try:
+                # The ledger applies the same finite flat-scalar/size contract;
+                # parse here to reject bad public shapes before the transition.
+                from .control import _encode_effect_result
+
+                encoded = _encode_effect_result(effect_result)
+                if encoded is None:
+                    raise ValueError
+            except (TypeError, ValueError, UnicodeError):
+                raise MonitorControlServiceError("INVALID_EFFECT_RESULT") from None
+        if outcome is ControlOwnerOutcome.UNKNOWN and effect_result is not None:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+    return command_id, outcome, effect_ref, effect_result
 
 
 def _parse_fields(
@@ -389,9 +472,124 @@ def _parse_fields(
     return arguments
 
 
-def _require_schema_v1(arguments: Mapping[str, Any]) -> None:
-    if type(arguments["schema_version"]) is not int or arguments["schema_version"] != 1:
+def _operation_schema_version(arguments: Mapping[str, Any]) -> int:
+    if not isinstance(arguments, Mapping):
+        raise MonitorControlServiceError("INVALID_ARGUMENTS")
+    version = arguments.get("schema_version")
+    if type(version) is not int or version not in (1, 2):
         raise MonitorControlServiceError("UNSUPPORTED_SCHEMA_VERSION")
+    return version
+
+
+def _validate_owner_effect(
+    command: object,
+    outcome: ControlOwnerOutcome,
+    effect_ref: str | None,
+    effect_result: Mapping[str, object] | None,
+) -> None:
+    if type(command) is not ControlCommand:
+        raise MonitorControlServiceError("MALFORMED_CONTROL_RESULT")
+    if outcome is ControlOwnerOutcome.UNKNOWN:
+        if effect_ref is not None or effect_result is not None:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        return
+
+    if command.action is ControlAction.FREEZE:
+        expected_ref = monitor_freeze_cause_id(command)
+        if outcome is not ControlOwnerOutcome.APPLIED or effect_ref != expected_ref:
+            raise MonitorControlServiceError("OWNER_EFFECT_REFERENCE_MISMATCH")
+        legacy_result = {
+            "action": "freeze",
+            "cause_id": expected_ref,
+            "risk_state": "active",
+        }
+        if effect_result == legacy_result:
+            # Preserve the v1 ledger/owner projection exactly. New signed v2
+            # freezes require the typed Risk activation receipt so a stale
+            # owner replay cannot be projected as currently active after a
+            # later exact RESUME.
+            if command.schema_version != 1:
+                raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+            return
+        expected_keys = {
+            "action",
+            "cause_id",
+            "activation_status",
+            "cause_active",
+            "has_other_active_freezes",
+            "risk_state",
+        }
+        if not isinstance(effect_result, Mapping) or set(effect_result) != expected_keys:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        activation_status = effect_result.get("activation_status")
+        if type(activation_status) is not str:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        expected_state = {
+            "CREATED": (True, "active"),
+            "ALREADY_ACTIVE": (True, "active"),
+            "ALREADY_RESOLVED": (False, "resolved"),
+        }.get(activation_status)
+        if (
+            effect_result.get("action") != "freeze"
+            or effect_result.get("cause_id") != expected_ref
+            or expected_state is None
+            or type(effect_result.get("cause_active")) is not bool
+            or type(effect_result.get("has_other_active_freezes")) is not bool
+            or (
+                effect_result.get("cause_active"),
+                effect_result.get("risk_state"),
+            )
+            != expected_state
+        ):
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        return
+
+    if command.action is ControlAction.RESUME:
+        target = command.target_freeze_cause_id
+        if target is None:
+            raise MonitorControlServiceError("UNSAFE_LEGACY_RESUME_RESULT")
+        if not isinstance(effect_result, Mapping):
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        expected_keys = {
+            "action",
+            "cause_id",
+            "resolution_status",
+            "has_other_active_freezes",
+            "account_still_frozen",
+        }
+        if set(effect_result) != expected_keys or effect_result.get("cause_id") != target:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        status = effect_result.get("resolution_status")
+        other_freezes = effect_result.get("has_other_active_freezes")
+        still_frozen = effect_result.get("account_still_frozen")
+        if (
+            effect_result.get("action") != "resume"
+            or type(other_freezes) is not bool
+            or type(still_frozen) is not bool
+            or still_frozen is not other_freezes
+        ):
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        if outcome is ControlOwnerOutcome.APPLIED:
+            if status not in {"CLEARED", "ALREADY_RESOLVED"}:
+                raise MonitorControlServiceError("OWNER_EFFECT_REFERENCE_MISMATCH")
+            if effect_ref != target:
+                raise MonitorControlServiceError("OWNER_EFFECT_REFERENCE_MISMATCH")
+        elif outcome is ControlOwnerOutcome.REJECTED:
+            if status != "NOT_FOUND" or effect_ref is not None:
+                raise MonitorControlServiceError("OWNER_EFFECT_REFERENCE_MISMATCH")
+        else:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        return
+
+    if command.action is ControlAction.DRAIN:
+        if (
+            outcome is not ControlOwnerOutcome.REJECTED
+            or effect_ref is not None
+            or effect_result != {"action": "drain", "result": "unsupported"}
+        ):
+            raise MonitorControlServiceError("ACTION_HAS_NO_APPLICABLE_OWNER_EFFECT")
+        return
+    raise MonitorControlServiceError("ACTION_HAS_NO_APPLICABLE_OWNER_EFFECT")
 
 
 def _validate_ledger_result(
@@ -429,6 +627,18 @@ def _validate_ledger_result(
             raise MonitorControlServiceError("MALFORMED_CONTROL_RESULT")
     elif result.outcome is not None:
         raise MonitorControlServiceError("MALFORMED_CONTROL_RESULT")
+    if result.effect_ref is not None and (
+        type(result.effect_ref) is not str or not result.effect_ref
+    ):
+        raise MonitorControlServiceError("MALFORMED_CONTROL_RESULT")
+    if result.effect_result is not None and not isinstance(result.effect_result, Mapping):
+        raise MonitorControlServiceError("MALFORMED_CONTROL_RESULT")
+    if (
+        result.command.action is ControlAction.RESUME
+        and result.status in (ControlStatus.PENDING, ControlStatus.CLAIMED)
+        and result.command.schema_version < 2
+    ):
+        raise MonitorControlServiceError("UNSAFE_LEGACY_RESUME_RESULT")
 
 
 def _command_status(command: ClaimedControlCommand) -> Mapping[str, Any]:
@@ -451,9 +661,14 @@ def _command_status(command: ClaimedControlCommand) -> Mapping[str, Any]:
             "command_id": command.command.command_id,
             "status": command.status.value,
             "outcome": typed_outcome,
+            "effect_ref": command.effect_ref,
+            "effect_result": (
+                dict(command.effect_result) if command.effect_result is not None else None
+            ),
             "request_recorded": True,
             "owner_final": owner_final,
-            "reconciliation_required": command.status is ControlStatus.UNKNOWN
+            "reconciliation_required": command.status
+            in (ControlStatus.CLAIMED, ControlStatus.UNKNOWN)
             or command.status in (ControlStatus.ACKNOWLEDGED, ControlStatus.REJECTED)
             and not owner_final,
         }
@@ -470,11 +685,14 @@ def _owner_command(command: ClaimedControlCommand) -> Mapping[str, Any]:
             "scope": value.scope,
             "action": value.action.value,
             "issuer": value.issuer,
+            "key_id": value.key_id,
             "reason": value.reason,
             "receipt_digest": value.receipt_digest,
             "issued_at": value.issued_at,
             "expires_at": value.expires_at,
             "manual_resume_authorized": value.manual_resume_authorized,
+            "schema_version": value.schema_version,
+            "target_freeze_cause_id": value.target_freeze_cause_id,
         }
     )
 

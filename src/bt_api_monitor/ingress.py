@@ -25,7 +25,7 @@ from .control import (
 
 CONTROL_COMMAND_HMAC_DOMAIN = b"bt-api-monitor.control-command.hmac.v1\0"
 _VERIFICATION_RECEIPT_DOMAIN = b"bt-api-monitor.control-command.verified.v1\0"
-_PAYLOAD_FIELDS = frozenset(
+_PAYLOAD_V1_FIELDS = frozenset(
     {
         "schema_version",
         "key_id",
@@ -43,6 +43,8 @@ _PAYLOAD_FIELDS = frozenset(
         "manual_resume_authorized",
     }
 )
+_PAYLOAD_V2_FIELDS = _PAYLOAD_V1_FIELDS.union({"target_freeze_cause_id"})
+_MONITOR_FREEZE_CAUSE_RE = re.compile(r"^monitor-freeze-v1:[0-9a-f]{64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -62,6 +64,7 @@ class _NormalizedClaims(TypedDict):
     expires_at: float
     issuer_sequence: int
     manual_resume_authorized: bool
+    target_freeze_cause_id: str | None
 
 
 class ControlKeyResolver(Protocol):
@@ -354,6 +357,8 @@ class HmacControlCommandVerifier:
             manual_resume_authorized=manual_resume,
             envelope_digest=envelope.digest,
             verification_digest=verification_digest,
+            schema_version=parsed["schema_version"],
+            target_freeze_cause_id=parsed["target_freeze_cause_id"],
         )
 
     @staticmethod
@@ -378,7 +383,19 @@ class HmacControlCommandVerifier:
             )
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
             raise ControlAuthorizationError("control_payload_invalid") from None
-        if type(value) is not dict or set(value) != _PAYLOAD_FIELDS:
+        if type(value) is not dict:
+            raise ControlAuthorizationError("control_payload_schema_invalid")
+        version = value.get("schema_version")
+        expected_fields = (
+            _PAYLOAD_V1_FIELDS
+            if type(version) is int and version == 1
+            else _PAYLOAD_V2_FIELDS
+            if type(version) is int and version == 2
+            else None
+        )
+        if expected_fields is None:
+            raise ControlAuthorizationError("control_payload_version_unsupported")
+        if set(value) != expected_fields:
             raise ControlAuthorizationError("control_payload_schema_invalid")
         try:
             canonical = json.dumps(
@@ -409,7 +426,8 @@ class HmacControlCommandVerifier:
 
     @staticmethod
     def _validate_claims(claims: dict[str, object]) -> _NormalizedClaims:
-        if type(claims["schema_version"]) is not int or claims["schema_version"] != 1:
+        schema_version = claims["schema_version"]
+        if type(schema_version) is not int or schema_version not in (1, 2):
             raise ControlAuthorizationError("control_payload_version_unsupported")
         text_claims: dict[str, str] = {}
         for name in (
@@ -452,8 +470,23 @@ class HmacControlCommandVerifier:
         manual_resume = claims["manual_resume_authorized"]
         if type(manual_resume) is not bool:
             raise ControlAuthorizationError("control_manual_resume_flag_invalid")
+        target_freeze_cause_id: str | None = None
+        if schema_version == 1:
+            if action is ControlAction.RESUME:
+                raise ControlAuthorizationError("control_resume_target_cause_required")
+        else:
+            target = claims["target_freeze_cause_id"]
+            if action is ControlAction.RESUME:
+                if (
+                    type(target) is not str
+                    or _MONITOR_FREEZE_CAUSE_RE.fullmatch(target) is None
+                ):
+                    raise ControlAuthorizationError("control_resume_target_cause_invalid")
+                target_freeze_cause_id = target
+            elif target is not None:
+                raise ControlAuthorizationError("control_target_cause_not_applicable")
         return {
-            "schema_version": 1,
+            "schema_version": schema_version,
             "key_id": text_claims["key_id"],
             "issuer": text_claims["issuer"],
             "command_id": text_claims["command_id"],
@@ -467,6 +500,7 @@ class HmacControlCommandVerifier:
             "expires_at": expires_at,
             "issuer_sequence": sequence,
             "manual_resume_authorized": manual_resume,
+            "target_freeze_cause_id": target_freeze_cause_id,
         }
 
     @staticmethod

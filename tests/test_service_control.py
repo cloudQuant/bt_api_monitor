@@ -20,6 +20,7 @@ from bt_api_monitor.control import (
     ControlOwnerOutcome,
     ControlStatus,
     DurableControlLedger,
+    monitor_freeze_cause_id,
 )
 from bt_api_monitor.ingress import (
     CONTROL_COMMAND_HMAC_DOMAIN,
@@ -162,9 +163,18 @@ def _request(
     account_id: str = ACCOUNT_ID,
     mode: str = MODE,
     reason: str = "offline acceptance test",
+    schema_version: int | None = None,
+    target_freeze_cause_id: str | None = None,
 ) -> dict[str, Any]:
+    version = (
+        schema_version
+        if schema_version is not None
+        else 2
+        if action is ControlAction.RESUME
+        else 1
+    )
     claims = {
-        "schema_version": 1,
+        "schema_version": version,
         "key_id": KEY_ID,
         "issuer": ISSUER,
         "command_id": command_id,
@@ -179,6 +189,12 @@ def _request(
         "issuer_sequence": issuer_sequence,
         "manual_resume_authorized": action is ControlAction.RESUME,
     }
+    if version == 2:
+        claims["target_freeze_cause_id"] = target_freeze_cause_id or (
+            "monitor-freeze-v1:" + "e" * 64
+            if action is ControlAction.RESUME
+            else None
+        )
     payload = json.dumps(
         claims, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
     ).encode("utf-8")
@@ -262,6 +278,8 @@ def test_submit_claim_owner_result_and_exact_retry_are_one_durable_flow(tmp_path
         "command_id": "freeze-1",
         "status": "pending",
         "outcome": None,
+        "effect_ref": None,
+        "effect_result": None,
         "request_recorded": True,
         "owner_final": False,
         "reconciliation_required": False,
@@ -281,7 +299,7 @@ def test_submit_claim_owner_result_and_exact_retry_are_one_durable_flow(tmp_path
     claimed = _handle(
         service,
         "monitor.claim",
-        {"schema_version": 1},
+        {"schema_version": 2, "command_id": "freeze-1"},
         identity=_owner(),
     )
     assert claimed["claimed"] is True
@@ -292,18 +310,40 @@ def test_submit_claim_owner_result_and_exact_retry_are_one_durable_flow(tmp_path
     final = _handle(
         service,
         "monitor.acknowledge",
-        {"schema_version": 1, "command_id": "freeze-1", "outcome": "applied"},
+        {
+            "schema_version": 2,
+            "command_id": "freeze-1",
+            "outcome": "applied",
+            "effect_ref": monitor_freeze_cause_id(ledger.get("freeze-1").command),
+            "effect_result": {
+                "action": "freeze",
+                "cause_id": monitor_freeze_cause_id(ledger.get("freeze-1").command),
+                "risk_state": "active",
+            },
+        },
         identity=_owner(),
     )
     assert final["status"] == "acknowledged"
     assert final["outcome"] == "applied"
     assert final["owner_final"] is True
     assert final["reconciliation_required"] is False
+    expected_effect_ref = monitor_freeze_cause_id(ledger.get("freeze-1").command)
+    assert final["effect_ref"] == expected_effect_ref
     assert _handle(service, "monitor.control", arguments) == final
     assert _handle(
         service,
         "monitor.acknowledge",
-        {"schema_version": 1, "command_id": "freeze-1", "outcome": "applied"},
+        {
+            "schema_version": 2,
+            "command_id": "freeze-1",
+            "outcome": "applied",
+            "effect_ref": expected_effect_ref,
+            "effect_result": {
+                "action": "freeze",
+                "cause_id": expected_effect_ref,
+                "risk_state": "active",
+            },
+        },
         identity=_owner(),
     ) == final
 
@@ -312,7 +352,17 @@ def test_submit_claim_owner_result_and_exact_retry_are_one_durable_flow(tmp_path
     assert _handle(
         reopened_service,
         "monitor.acknowledge",
-        {"schema_version": 1, "command_id": "freeze-1", "outcome": "applied"},
+        {
+            "schema_version": 2,
+            "command_id": "freeze-1",
+            "outcome": "applied",
+            "effect_ref": expected_effect_ref,
+            "effect_result": {
+                "action": "freeze",
+                "cause_id": expected_effect_ref,
+                "risk_state": "active",
+            },
+        },
         identity=_owner(),
     ) == final
     assert reopened_ledger.get("freeze-1").status is ControlStatus.ACKNOWLEDGED
@@ -414,6 +464,7 @@ def test_owner_operations_are_separate_and_unknown_never_projects_as_final(tmp_p
     assert unknown["outcome"] == "unknown"
     assert unknown["owner_final"] is False
     assert unknown["reconciliation_required"] is True
+    assert unknown["effect_ref"] is None
     assert "risk_resolved" not in unknown
     assert "freeze_resolved" not in unknown
     assert ledger.get("resume-unknown").status is ControlStatus.UNKNOWN
@@ -520,3 +571,142 @@ def test_control_role_requires_only_public_submit_bind_and_known_operations() ->
         "UNSUPPORTED_SERVICE_OPTIONS",
         lambda: validate_service_options({"role": "read_only"}, (MONITOR_CONTROL_PUBLIC_PORT,)),
     )
+
+
+def test_exact_owner_claim_cannot_pass_an_earlier_unresolved_route_command(tmp_path: Path) -> None:
+    ledger, service = _service(tmp_path / "exact-claim.sqlite")
+    _handle(service, "monitor.control", _request("first-command"))
+    _handle(service, "monitor.control", _request("target-command", issuer_sequence=2))
+
+    claimed = _handle(
+        service,
+        "monitor.claim",
+        {"schema_version": 2, "command_id": "target-command"},
+        identity=_owner(),
+    )
+    assert claimed == {"claimed": False, "command": None}
+    assert ledger.get("first-command").status is ControlStatus.PENDING
+    assert ledger.get("target-command").status is ControlStatus.PENDING
+
+    first = _handle(
+        service,
+        "monitor.claim",
+        {"schema_version": 2, "command_id": "first-command"},
+        identity=_owner(),
+    )
+    assert first["claimed"] is True
+    first_effect = monitor_freeze_cause_id(ledger.get("first-command").command)
+    _handle(
+        service,
+        "monitor.acknowledge",
+        {
+            "schema_version": 2,
+            "command_id": "first-command",
+            "outcome": "applied",
+            "effect_ref": first_effect,
+            "effect_result": {
+                "action": "freeze",
+                "cause_id": first_effect,
+                "risk_state": "active",
+            },
+        },
+        identity=_owner(),
+    )
+
+    claimed = _handle(
+        service,
+        "monitor.claim",
+        {"schema_version": 2, "command_id": "target-command"},
+        identity=_owner(),
+    )
+    assert claimed["claimed"] is True
+    assert claimed["command"]["command_id"] == "target-command"
+    assert ledger.get("target-command").status is ControlStatus.CLAIMED
+
+    duplicate_claim = _handle(
+        service,
+        "monitor.claim",
+        {"schema_version": 2, "command_id": "target-command"},
+        identity=_owner(),
+    )
+    assert duplicate_claim == {"claimed": False, "command": None}
+
+
+def test_applied_outcome_is_durably_bound_to_effect_reference(tmp_path: Path) -> None:
+    ledger, service = _service(tmp_path / "effect-ref.sqlite")
+    request = _request("effect-command", schema_version=2)
+    _handle(service, "monitor.control", request)
+    _handle(
+        service,
+        "monitor.claim",
+        {"schema_version": 2, "command_id": "effect-command"},
+        identity=_owner(),
+    )
+    effect_ref = monitor_freeze_cause_id(ledger.get("effect-command").command)
+    applied = _handle(
+        service,
+        "monitor.acknowledge",
+        {
+            "schema_version": 2,
+            "command_id": "effect-command",
+            "outcome": "applied",
+            "effect_ref": effect_ref,
+            "effect_result": {
+                "action": "freeze",
+                "cause_id": effect_ref,
+                "activation_status": "CREATED",
+                "cause_active": True,
+                "has_other_active_freezes": False,
+                "risk_state": "active",
+            },
+        },
+        identity=_owner(),
+    )
+    assert applied["owner_final"] is True
+    assert applied["effect_ref"] == effect_ref
+    assert ledger.get("effect-command").effect_ref == effect_ref
+    assert _handle(service, "monitor.control", request) == applied
+
+    _error(
+        "INVALID_EFFECT_RESULT",
+        lambda: _handle(
+            service,
+            "monitor.acknowledge",
+            {
+                "schema_version": 2,
+                "command_id": "effect-command",
+                "outcome": "applied",
+                "effect_ref": effect_ref,
+                "effect_result": {
+                    "action": "freeze",
+                    "cause_id": effect_ref,
+                    "risk_state": "active",
+                },
+            },
+            identity=_owner(),
+        ),
+    )
+
+    _error(
+        "OWNER_EFFECT_REFERENCE_MISMATCH",
+        lambda: _handle(
+            service,
+            "monitor.acknowledge",
+            {
+                "schema_version": 2,
+                "command_id": "effect-command",
+                "outcome": "applied",
+                "effect_ref": "monitor-freeze-v1:" + "2" * 64,
+                "effect_result": {
+                    "action": "freeze",
+                    "cause_id": "monitor-freeze-v1:" + "2" * 64,
+                    "activation_status": "CREATED",
+                    "cause_active": True,
+                    "has_other_active_freezes": False,
+                    "risk_state": "active",
+                },
+            },
+            identity=_owner(),
+        ),
+    )
+    assert ledger.get("effect-command").effect_ref == effect_ref
