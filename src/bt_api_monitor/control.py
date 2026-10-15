@@ -66,6 +66,46 @@ class ControlStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ControlOwnerOutcome(str, Enum):
+    """Finite outcomes an authenticated owner may persist for a claimed command."""
+
+    APPLIED = "applied"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ControlCommandBinding:
+    """Trusted service-side binding for one verified control submission.
+
+    The HMAC verifier proves the issuer's signed claims. This additional binding
+    ties those claims to the authenticated wire caller and the configured
+    account/mode/scope route before the ledger is changed.
+    """
+
+    issuer: str
+    account_id: str
+    mode: str
+    scope: str
+    actions: frozenset[ControlAction]
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("issuer", self.issuer),
+            ("account_id", self.account_id),
+            ("mode", self.mode),
+            ("scope", self.scope),
+        ):
+            if type(value) is not str or not value.strip() or value != value.strip():
+                raise ValueError(name + " is required")
+        if (
+            type(self.actions) is not frozenset
+            or not self.actions
+            or any(type(action) is not ControlAction for action in self.actions)
+        ):
+            raise ValueError("actions must be a non-empty set of ControlAction values")
+
+
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTROL_ENVELOPE_DOMAIN = b"bt-api-monitor-control-envelope-v1\0"
 _INGRESS_PROOF = object()
@@ -397,10 +437,31 @@ class DurableControlLedger:
             )
             return ClaimedControlCommand(durable_command, status, None)
 
-    def claim_next(self, scope: str, executor_id: str) -> Optional[ClaimedControlCommand]:  # noqa: UP045 -- Python 3.9 is supported.
+    def claim_next(
+        self,
+        scope: str,
+        executor_id: str,
+        *,
+        account_id: str | None = None,
+        mode: str | None = None,
+    ) -> Optional[ClaimedControlCommand]:  # noqa: UP045 -- Python 3.9 is supported.
         """Lease the oldest pending unexpired command in the requested scope."""
-        if not scope.strip() or not executor_id.strip():
+        if (
+            type(scope) is not str
+            or not scope.strip()
+            or type(executor_id) is not str
+            or not executor_id.strip()
+        ):
             raise ValueError("scope and executor_id are required")
+        if (account_id is None) != (mode is None):
+            raise ValueError("account_id and mode must be provided together")
+        if account_id is not None and (
+            type(account_id) is not str
+            or not account_id.strip()
+            or type(mode) is not str
+            or not mode.strip()
+        ):
+            raise ValueError("account_id and mode must be non-empty strings")
         now = self._clock()
         with self._transaction() as connection:
             self._expire_pending(connection, now)
@@ -414,9 +475,19 @@ class DurableControlLedger:
                     AND key_id IS NOT NULL AND key_id <> ''
                     AND envelope_digest IS NOT NULL AND envelope_digest <> ''
                     AND verification_digest IS NOT NULL AND verification_digest <> ''
+                    AND (? IS NULL OR account_id = ?)
+                    AND (? IS NULL OR mode = ?)
                 ORDER BY issued_at ASC, command_id ASC LIMIT 1
                 """,
-                (scope, ControlStatus.PENDING.value, now),
+                (
+                    scope,
+                    ControlStatus.PENDING.value,
+                    now,
+                    account_id,
+                    account_id,
+                    mode,
+                    mode,
+                ),
             ).fetchone()
             if row is None:
                 return None
@@ -465,6 +536,58 @@ class DurableControlLedger:
                     (status.value, outcome, now, command_id),
                 )
         # Commit timeout/unknown facts even when the attempted ACK is rejected.
+        if failure is not None:
+            raise failure
+
+    def finish_owner_outcome(
+        self, command_id: str, executor_id: str, outcome: ControlOwnerOutcome
+    ) -> None:
+        """Persist a finite owner result, keeping uncertain effects UNKNOWN.
+
+        This operation is for an owner that already claimed the command. An
+        unknown result remains unresolved and cannot be converted into an
+        acknowledgement by choosing a success boolean.
+        """
+
+        if (
+            type(command_id) is not str
+            or not command_id.strip()
+            or type(executor_id) is not str
+            or not executor_id.strip()
+        ):
+            raise ValueError("command_id and executor_id are required")
+        if type(outcome) is not ControlOwnerOutcome:
+            raise ValueError("a ControlOwnerOutcome is required")
+        status = {
+            ControlOwnerOutcome.APPLIED: ControlStatus.ACKNOWLEDGED,
+            ControlOwnerOutcome.REJECTED: ControlStatus.REJECTED,
+            ControlOwnerOutcome.UNKNOWN: ControlStatus.UNKNOWN,
+        }[outcome]
+        failure = None
+        with self._transaction() as connection:
+            now = self._clock()
+            self._expire_pending(connection, now)
+            row = connection.execute(
+                "SELECT * FROM monitor_control_commands WHERE command_id = ?", (command_id,)
+            ).fetchone()
+            if row is None:
+                failure = ControlClaimError("command does not exist")
+            elif row["executor_id"] != executor_id:
+                failure = ControlClaimError("command is owned by another executor")
+            elif row["status"] == status.value and row["outcome"] == outcome.value:
+                return
+            elif row["status"] != ControlStatus.CLAIMED.value:
+                failure = ControlClaimError(
+                    "command is not claimed; reconciliation may be required"
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE monitor_control_commands SET status = ?, outcome = ?, updated_at = ?
+                    WHERE command_id = ?
+                    """,
+                    (status.value, outcome.value, now, command_id),
+                )
         if failure is not None:
             raise failure
 
@@ -654,11 +777,24 @@ class ControlIngress:
         self._verifier = verifier
         self._clock = clock or ledger._clock
 
-    def submit(self, envelope: ControlCommandEnvelope) -> ClaimedControlCommand:
+    @property
+    def ledger(self) -> DurableControlLedger:
+        """Return the exact durable ledger owned by this ingress composition."""
+
+        return self._ledger
+
+    def submit(
+        self,
+        envelope: ControlCommandEnvelope,
+        *,
+        binding: ControlCommandBinding | None = None,
+    ) -> ClaimedControlCommand:
         """Authenticate, normalize and persist exactly one control command."""
 
         if type(envelope) is not ControlCommandEnvelope:
             raise ControlAuthorizationError("control_envelope_required")
+        if binding is not None and type(binding) is not ControlCommandBinding:
+            raise ControlAuthorizationError("control_binding_invalid")
         verifier = self._verifier
         verify = getattr(verifier, "verify", None)
         if not callable(verify):
@@ -695,6 +831,14 @@ class ControlIngress:
 
         if verified.envelope_digest != envelope.digest:
             raise ControlAuthorizationError("verified_envelope_digest_mismatch")
+        if binding is not None and (
+            verified.issuer != binding.issuer
+            or verified.account_id != binding.account_id
+            or verified.mode != binding.mode
+            or verified.scope != binding.scope
+            or verified.action not in binding.actions
+        ):
+            raise ControlAuthorizationError("verified_control_binding_mismatch")
 
         command = ControlCommand(
             command_id=verified.command_id,
@@ -740,6 +884,7 @@ __all__ = [
     "ClaimedControlCommand",
     "ControlAction",
     "ControlAuthorizationError",
+    "ControlCommandBinding",
     "ControlClaimError",
     "ControlCommand",
     "ControlCommandEnvelope",
@@ -747,6 +892,7 @@ __all__ = [
     "ControlConflictError",
     "ControlIngress",
     "ControlLedgerError",
+    "ControlOwnerOutcome",
     "ControlSequenceError",
     "ControlStatus",
     "DurableControlLedger",
