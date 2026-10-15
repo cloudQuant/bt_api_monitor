@@ -73,6 +73,15 @@ _EXPORT_MODULES = {
     ),
     **dict.fromkeys(
         (
+            "GATEWAY_MARKET_OBSERVATION_EVENT_TYPE",
+            "MONITOR_MARKET_OBSERVATION_SCHEMA",
+            "MonitorMarketObservationError",
+            "MonitorMarketObservationProjector",
+        ),
+        ".market_observation",
+    ),
+    **dict.fromkeys(
+        (
             "ElasticsearchClient",
             "ELKIntegration",
             "LogstashHandler",
@@ -198,6 +207,10 @@ __all__ = [
     "OutboxError",
     "OutboxEvent",
     "SequencedOutboxEvent",
+    "GATEWAY_MARKET_OBSERVATION_EVENT_TYPE",
+    "MONITOR_MARKET_OBSERVATION_SCHEMA",
+    "MonitorMarketObservationError",
+    "MonitorMarketObservationProjector",
     "EconomicFactReadModel",
     "FactCursorError",
     "FactPage",
