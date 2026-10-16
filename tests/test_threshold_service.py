@@ -125,6 +125,31 @@ def test_operator_config_rejects_alert_feedback_and_global_budget_overflow() -> 
     assert duplicate_field.value.code == "CONFIG_JSON_INVALID"
 
 
+def test_operator_config_enforces_global_rule_window_and_label_budgets() -> None:
+    too_many_rules = _config()
+    second_rule = dict(too_many_rules["rules"][0])
+    second_rule["rule_id"] = "quote-count-secondary"
+    too_many_rules["rules"].append(second_rule)
+    too_many_rules["storage_policy"]["max_rule_configs"] = 1
+    with pytest.raises(ThresholdServiceError) as rule_count:
+        parse_threshold_service_config(json.dumps(too_many_rules), {"target-a": _TARGET_A})
+    assert rule_count.value.code == "RULE_COUNT_EXCEEDS_GLOBAL_POLICY"
+
+    too_many_window_events = _config()
+    too_many_window_events["storage_policy"]["max_window_events"] = 3
+    with pytest.raises(ThresholdServiceError) as window_budget:
+        parse_threshold_service_config(
+            json.dumps(too_many_window_events), {"target-a": _TARGET_A}
+        )
+    assert window_budget.value.code == "WINDOW_BUDGET_EXCEEDS_GLOBAL_POLICY"
+
+    too_many_label_bytes = _config(max_keys=2)
+    too_many_label_bytes["storage_policy"]["max_label_bytes"] = 4_095
+    with pytest.raises(ThresholdServiceError) as label_budget:
+        parse_threshold_service_config(json.dumps(too_many_label_bytes), {"target-a": _TARGET_A})
+    assert label_budget.value.code == "LABEL_STORAGE_EXCEEDS_GLOBAL_POLICY"
+
+
 def test_global_dimension_limit_keeps_overflow_event_pending(tmp_path) -> None:
     database = tmp_path / "threshold-global-limit.sqlite"
     outbox = DurableOutbox(database)
@@ -155,6 +180,78 @@ def test_global_dimension_limit_keeps_overflow_event_pending(tmp_path) -> None:
     assert isinstance(error.value.__cause__, ThresholdRuleCapacityError)
     assert loop.checkpoint(rule.outbox_scope) == first.sequence
     pending = outbox.read_pending("global-limit-consumer", rule.outbox_scope)
+    assert [item.sequence for item in pending] == [second.sequence]
+
+
+def test_global_window_capacity_keeps_overflow_source_event_pending(tmp_path) -> None:
+    database = tmp_path / "threshold-global-window.sqlite"
+    outbox = DurableOutbox(database)
+    rule = ThresholdRule(
+        rule_id="global-window-limit",
+        outbox_scope=_TARGET_A.ingress_target.outbox_scope,
+        event_type=_SOURCE_EVENT,
+        window_seconds=60,
+        threshold_count=2,
+        dimension_fields=("instrument_key",),
+        max_dimension_keys=2,
+        max_window_events=2,
+    )
+    loop = ScopedThresholdRuleLoop(
+        outbox,
+        (rule,),
+        lambda _alert: None,
+        consumer_id="global-window-consumer",
+        storage_policy=_policy(max_dimension_groups=2, max_window_events=1),
+    )
+    outbox.append(_event("window-a", "contract-a", 10_000.0))
+    second = outbox.append(_event("window-b", "contract-b", 10_001.0))
+
+    with pytest.raises(OutboxDeliveryError) as error:
+        loop.run_once(limit=2)
+
+    assert isinstance(error.value.__cause__, ThresholdRuleCapacityError)
+    assert "global window-event capacity" in str(error.value.__cause__)
+    assert loop.checkpoint(rule.outbox_scope) == 1
+    assert loop.rule_status(rule.rule_id).window_count == 1
+    pending = outbox.read_pending("global-window-consumer", rule.outbox_scope, limit=2)
+    assert [item.sequence for item in pending] == [second.sequence]
+
+
+def test_global_label_byte_capacity_keeps_overflow_source_event_pending(tmp_path) -> None:
+    database = tmp_path / "threshold-global-labels.sqlite"
+    outbox = DurableOutbox(database)
+    rule = ThresholdRule(
+        rule_id="global-label-limit",
+        outbox_scope=_TARGET_A.ingress_target.outbox_scope,
+        event_type=_SOURCE_EVENT,
+        window_seconds=60,
+        threshold_count=1,
+        dimension_fields=("instrument_key",),
+        max_dimension_keys=2,
+        max_window_events=2,
+    )
+    loop = ScopedThresholdRuleLoop(
+        outbox,
+        (rule,),
+        lambda _alert: None,
+        consumer_id="global-label-consumer",
+        storage_policy=_policy(
+            max_dimension_groups=2,
+            max_window_events=2,
+            max_label_bytes=250,
+        ),
+    )
+    first = outbox.append(_event("label-a", "A" * 100, 10_000.0))
+    second = outbox.append(_event("label-b", "B" * 100, 10_001.0))
+
+    with pytest.raises(OutboxDeliveryError) as error:
+        loop.run_once(limit=2)
+
+    assert isinstance(error.value.__cause__, ThresholdRuleCapacityError)
+    assert "global dimension-label capacity" in str(error.value.__cause__)
+    assert loop.checkpoint(rule.outbox_scope) == first.sequence
+    assert loop.rule_status(rule.rule_id).dimension_keys == 1
+    pending = outbox.read_pending("global-label-consumer", rule.outbox_scope, limit=2)
     assert [item.sequence for item in pending] == [second.sequence]
 
 
