@@ -137,6 +137,17 @@ class DurableOutbox:
 
         return self._read_only
 
+    @property
+    def database_path(self) -> Path:
+        """Return the local SQLite path for trusted same-host worker composition.
+
+        This is an operator-side resource locator.  It is never included in an
+        event, service reply, or client capability; child workers use it only
+        to reopen the same durable database after process restart.
+        """
+
+        return self._database_path
+
     def append(self, event: OutboxEvent) -> SequencedOutboxEvent:
         """Persist an event or return its existing sequence for an exact retry."""
         self._require_writable()

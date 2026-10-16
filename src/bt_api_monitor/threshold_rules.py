@@ -54,6 +54,13 @@ DEFAULT_MAX_WINDOW_EVENTS = 10_000
 MAX_DIMENSION_VALUE_BYTES = 512
 MAX_DIMENSION_KEY_BYTES = 2048
 MAX_LATE_SECONDS = 86_400.0
+MAX_PERSISTED_RULE_CONFIGS = 4_096
+MAX_PERSISTED_DIMENSION_GROUPS = 16_384
+MAX_PERSISTED_WINDOW_EVENTS = 131_072
+MAX_PERSISTED_LABEL_BYTES = 64 * 1024 * 1024
+MAX_PERSISTED_ALERT_ROWS = 100_000
+MAX_ALERT_RETENTION_SECONDS = 90 * 24 * 60 * 60
+DEFAULT_ALERT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _SOURCE_COMPLETENESS_EVENT_ONLY = "received_event_only"
 _ALERT_ID_DOMAIN = "bt-api-monitor.threshold-alert.v2"
 _MAX_RULE_ID_BYTES = 128
@@ -84,6 +91,41 @@ class ThresholdRuleCapacityError(ThresholdRuleError):
 
 class ThresholdLateEventError(ThresholdRuleError):
     """A source event exceeds the rule's allowed event-time lateness."""
+
+
+@dataclass(frozen=True)
+class ThresholdRuleStoragePolicy:
+    """Global durable-state bounds shared by every consumer using one database.
+
+    These values are operator policy, not request fields.  The first loop
+    persists the policy in SQLite; later workers must reopen the database with
+    the same policy so a restart cannot silently enlarge its storage budget.
+    """
+
+    max_rule_configs: int = MAX_PERSISTED_RULE_CONFIGS
+    max_dimension_groups: int = MAX_PERSISTED_DIMENSION_GROUPS
+    max_window_events: int = MAX_PERSISTED_WINDOW_EVENTS
+    max_label_bytes: int = MAX_PERSISTED_LABEL_BYTES
+    max_alert_rows: int = MAX_PERSISTED_ALERT_ROWS
+    alert_retention_seconds: int = DEFAULT_ALERT_RETENTION_SECONDS
+
+    def __post_init__(self) -> None:
+        limits = (
+            (self.max_rule_configs, 1, MAX_PERSISTED_RULE_CONFIGS),
+            (self.max_dimension_groups, 1, MAX_PERSISTED_DIMENSION_GROUPS),
+            (self.max_window_events, 1, MAX_PERSISTED_WINDOW_EVENTS),
+            (self.max_label_bytes, 1, MAX_PERSISTED_LABEL_BYTES),
+            (self.max_alert_rows, 1, MAX_PERSISTED_ALERT_ROWS),
+            (self.alert_retention_seconds, 3_600, MAX_ALERT_RETENTION_SECONDS),
+        )
+        if any(
+            type(value) is not int or not lower <= value <= upper
+            for value, lower, upper in limits
+        ):
+            raise ThresholdRuleError("storage policy is outside its bounded range")
+
+
+DEFAULT_THRESHOLD_STORAGE_POLICY = ThresholdRuleStoragePolicy()
 
 
 @dataclass(frozen=True)
@@ -248,6 +290,7 @@ class ScopedThresholdRuleLoop:
         *,
         consumer_id: str = DEFAULT_RULE_CONSUMER_ID,
         clock: Callable[[], float] | None = None,
+        storage_policy: ThresholdRuleStoragePolicy = DEFAULT_THRESHOLD_STORAGE_POLICY,
     ) -> None:
         if not isinstance(outbox, DurableOutbox) or outbox.is_read_only:
             raise ThresholdRuleError("outbox must be a writable DurableOutbox")
@@ -262,6 +305,10 @@ class ScopedThresholdRuleLoop:
             raise ThresholdRuleError("alert_sink must be callable")
         if clock is not None and not callable(clock):
             raise ThresholdRuleError("clock must be callable")
+        if type(storage_policy) is not ThresholdRuleStoragePolicy:
+            raise ThresholdRuleError("storage_policy must be an operator policy value")
+        if len(rules) > storage_policy.max_rule_configs:
+            raise ThresholdRuleCapacityError("configured rule count exceeds storage policy")
 
         scope_rules: dict[str, list[ThresholdRule]] = {}
         for rule in rules:
@@ -270,6 +317,7 @@ class ScopedThresholdRuleLoop:
         self._consumer_id = consumer_id
         self._alert_sink = alert_sink
         self._clock = time.time if clock is None else clock
+        self._storage_policy = storage_policy
         self._rules = {rule.rule_id: rule for rule in rules}
         self._scope_rules = {
             scope: tuple(sorted(group, key=lambda rule: rule.rule_id))
@@ -350,6 +398,7 @@ class ScopedThresholdRuleLoop:
 
         if type(limit) is not int or not 1 <= limit <= MAX_RUN_LIMIT:
             raise ThresholdRuleError("limit is outside the bounded run range")
+        self._prune_expired_delivered_alerts()
         self._assert_all_active()
         emitted: list[ThresholdAlert] = []
         alert_budget = [limit]
@@ -484,6 +533,14 @@ class ScopedThresholdRuleLoop:
                         raise ThresholdLateEventError(late_reason)
                     late_events += 1
                     group_late_events += 1
+                    self._assert_group_storage_capacity(
+                        connection,
+                        rule,
+                        dimension_json,
+                        0 if group is None else len(window),
+                        len(window),
+                        group_exists=group is not None,
+                    )
                     self._write_group(
                         connection,
                         rule,
@@ -525,6 +582,14 @@ class ScopedThresholdRuleLoop:
                             len(window),
                         )
                         self._insert_alert(connection, alert)
+                    self._assert_group_storage_capacity(
+                        connection,
+                        rule,
+                        dimension_json,
+                        0 if group is None else int(group["window_count"]),
+                        len(window),
+                        group_exists=group is not None,
+                    )
                     self._write_group(
                         connection,
                         rule,
@@ -614,7 +679,73 @@ class ScopedThresholdRuleLoop:
             ),
         )
 
+    def _assert_group_storage_capacity(
+        self,
+        connection,
+        rule: ThresholdRule,
+        dimension_json: str,
+        previous_window_count: int,
+        next_window_count: int,
+        *,
+        group_exists: bool,
+    ) -> None:
+        """Enforce database-wide group, window, and label budgets atomically."""
+
+        totals = connection.execute(
+            """
+            SELECT COUNT(*) AS groups,
+                   COALESCE(SUM(window_count), 0) AS window_events,
+                   COALESCE(SUM(length(CAST(dimensions_json AS BLOB))), 0) AS label_bytes
+            FROM monitor_threshold_rule_groups
+            """
+        ).fetchone()
+        if totals is None:
+            raise ThresholdRuleError("durable threshold storage totals are unavailable")
+        group_count = int(totals["groups"])
+        label_bytes = int(totals["label_bytes"])
+        if not group_exists:
+            if group_count >= self._storage_policy.max_dimension_groups:
+                raise ThresholdRuleCapacityError("global dimension-group capacity reached")
+            label_bytes += len(dimension_json.encode("utf-8"))
+        window_events = int(totals["window_events"]) - previous_window_count + next_window_count
+        if window_events > self._storage_policy.max_window_events:
+            raise ThresholdRuleCapacityError("global window-event capacity reached")
+        if label_bytes > self._storage_policy.max_label_bytes:
+            raise ThresholdRuleCapacityError("global dimension-label capacity reached")
+
+    def _prune_expired_delivered_alerts(self) -> int:
+        """Apply bounded audit retention without dropping pending delivery work."""
+
+        cutoff = _finite_clock(self._clock) - self._storage_policy.alert_retention_seconds
+        with self._outbox._transaction() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM monitor_threshold_alert_outbox
+                WHERE delivery_state = 'DELIVERED' AND delivered_at < ?
+                """,
+                (cutoff,),
+            )
+            return int(cursor.rowcount)
+
     def _insert_alert(self, connection, alert: ThresholdAlert) -> None:
+        existing = connection.execute(
+            "SELECT 1 FROM monitor_threshold_alert_outbox WHERE alert_id = ?",
+            (alert.alert_id,),
+        ).fetchone()
+        if existing is None:
+            cutoff = _finite_clock(self._clock) - self._storage_policy.alert_retention_seconds
+            connection.execute(
+                """
+                DELETE FROM monitor_threshold_alert_outbox
+                WHERE delivery_state = 'DELIVERED' AND delivered_at < ?
+                """,
+                (cutoff,),
+            )
+            retained = connection.execute(
+                "SELECT COUNT(*) AS n FROM monitor_threshold_alert_outbox"
+            ).fetchone()
+            if retained is None or int(retained["n"]) >= self._storage_policy.max_alert_rows:
+                raise ThresholdRuleCapacityError("durable alert retention capacity reached")
         values = (
             self._consumer_id,
             alert.rule_id,
@@ -730,6 +861,7 @@ class ScopedThresholdRuleLoop:
     def _initialize_and_register_rules(self) -> None:
         with self._outbox._transaction() as connection:
             _create_schema(connection)
+            _ensure_storage_policy(connection, self._storage_policy, self._clock)
             for rule in self._rules.values():
                 config_json = _rule_config_json(rule)
                 config = connection.execute(
@@ -772,6 +904,15 @@ class ScopedThresholdRuleLoop:
                     raise ThresholdRuleError(
                         "rule scope cannot change across versions; create a new rule_id"
                     )
+
+                current_configs = connection.execute(
+                    "SELECT COUNT(*) AS n FROM monitor_threshold_rule_configs"
+                ).fetchone()
+                if (
+                    current_configs is None
+                    or int(current_configs["n"]) >= self._storage_policy.max_rule_configs
+                ):
+                    raise ThresholdRuleCapacityError("durable rule-config capacity reached")
 
                 checkpoint_row = connection.execute(
                     """
@@ -868,6 +1009,15 @@ class ScopedThresholdRuleLoop:
 def _create_schema(connection) -> None:
     connection.execute(
         """
+        CREATE TABLE IF NOT EXISTS monitor_threshold_storage_policy (
+            policy_id INTEGER PRIMARY KEY CHECK (policy_id = 1),
+            policy_json TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
         CREATE TABLE IF NOT EXISTS monitor_threshold_rule_configs (
             consumer_id TEXT NOT NULL,
             rule_id TEXT NOT NULL,
@@ -962,6 +1112,65 @@ def _create_schema(connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_monitor_threshold_alert_delivery
         ON monitor_threshold_alert_outbox(consumer_id, scope, delivery_state, created_at)
         """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_monitor_threshold_alert_retention
+        ON monitor_threshold_alert_outbox(delivery_state, delivered_at)
+        """
+    )
+
+
+def _ensure_storage_policy(
+    connection,
+    policy: ThresholdRuleStoragePolicy,
+    clock: Callable[[], float],
+) -> None:
+    policy_json = _storage_policy_json(policy)
+    current = connection.execute(
+        "SELECT policy_json FROM monitor_threshold_storage_policy WHERE policy_id = 1"
+    ).fetchone()
+    if current is None:
+        connection.execute(
+            "INSERT INTO monitor_threshold_storage_policy(policy_id, policy_json, created_at) "
+            "VALUES (1, ?, ?)",
+            (policy_json, _finite_clock(clock)),
+        )
+    elif str(current["policy_json"]) != policy_json:
+        raise ThresholdRuleError("storage policy does not match the durable database policy")
+    totals = connection.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM monitor_threshold_rule_configs) AS rule_configs,
+            (SELECT COUNT(*) FROM monitor_threshold_rule_groups) AS dimension_groups,
+            (SELECT COALESCE(SUM(window_count), 0) FROM monitor_threshold_rule_groups)
+                AS window_events,
+            (SELECT COALESCE(SUM(length(CAST(dimensions_json AS BLOB))), 0)
+             FROM monitor_threshold_rule_groups) AS label_bytes,
+            (SELECT COUNT(*) FROM monitor_threshold_alert_outbox) AS alert_rows
+        """
+    ).fetchone()
+    if totals is None or (
+        int(totals["rule_configs"]) > policy.max_rule_configs
+        or int(totals["dimension_groups"]) > policy.max_dimension_groups
+        or int(totals["window_events"]) > policy.max_window_events
+        or int(totals["label_bytes"]) > policy.max_label_bytes
+        or int(totals["alert_rows"]) > policy.max_alert_rows
+    ):
+        raise ThresholdRuleCapacityError("durable threshold state exceeds storage policy")
+
+
+def _storage_policy_json(policy: ThresholdRuleStoragePolicy) -> str:
+    return _canonical_json(
+        {
+            "alert_retention_seconds": policy.alert_retention_seconds,
+            "max_alert_rows": policy.max_alert_rows,
+            "max_dimension_groups": policy.max_dimension_groups,
+            "max_label_bytes": policy.max_label_bytes,
+            "max_rule_configs": policy.max_rule_configs,
+            "max_window_events": policy.max_window_events,
+            "schema_version": 1,
+        }
     )
 
 
@@ -1256,6 +1465,7 @@ def _validate_scoped_text(name: str, value: object, max_bytes: int) -> None:
 
 
 __all__ = [
+    "DEFAULT_ALERT_RETENTION_SECONDS",
     "DEFAULT_MAX_DIMENSION_KEYS",
     "DEFAULT_MAX_WINDOW_EVENTS",
     "DEFAULT_RULE_CONSUMER_ID",
@@ -1265,7 +1475,13 @@ __all__ = [
     "MAX_RULE_VERSION",
     "MAX_RULE_WINDOW_SECONDS",
     "MAX_RUN_LIMIT",
+    "MAX_PERSISTED_ALERT_ROWS",
+    "MAX_PERSISTED_DIMENSION_GROUPS",
+    "MAX_PERSISTED_LABEL_BYTES",
+    "MAX_PERSISTED_RULE_CONFIGS",
+    "MAX_PERSISTED_WINDOW_EVENTS",
     "MAX_WINDOW_EVENTS",
+    "DEFAULT_THRESHOLD_STORAGE_POLICY",
     "THRESHOLD_ALERT_ID_PREFIX",
     "ScopedThresholdRuleLoop",
     "ThresholdAlert",
@@ -1274,4 +1490,5 @@ __all__ = [
     "ThresholdRuleCapacityError",
     "ThresholdRuleError",
     "ThresholdRuleStatus",
+    "ThresholdRuleStoragePolicy",
 ]
