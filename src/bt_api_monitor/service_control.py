@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -68,6 +69,7 @@ _MAX_CONTROL_SIGNATURE_BYTES = 16 * 1024
 _MAX_PAYLOAD_B64_CHARS = ((_MAX_CONTROL_PAYLOAD_BYTES + 2) // 3) * 4
 _MAX_SIGNATURE_B64_CHARS = ((_MAX_CONTROL_SIGNATURE_BYTES + 2) // 3) * 4
 _MAX_CONTROL_TEXT_BYTES = 256
+_STRATEGY_STOP_EFFECT_REF = re.compile(r"^strategy-stop-new-v1:[0-9a-f]{64}$")
 
 MONITOR_CONTROL_PORT_OPERATIONS = MappingProxyType(
     {
@@ -592,6 +594,31 @@ def _validate_owner_effect(
             )
             != expected_state
         ):
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        return
+
+    if command.action is ControlAction.STOP_NEW:
+        if not isinstance(effect_result, Mapping) or set(effect_result) != {"action", "result"}:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        if effect_result.get("action") != "stop_new":
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        result = effect_result.get("result")
+        if type(result) is not str:
+            raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
+        if outcome is ControlOwnerOutcome.APPLIED:
+            if (
+                type(effect_ref) is not str
+                or _STRATEGY_STOP_EFFECT_REF.fullmatch(effect_ref) is None
+                or result not in {"fenced", "already_fenced"}
+            ):
+                raise MonitorControlServiceError("OWNER_EFFECT_REFERENCE_MISMATCH")
+        elif outcome is ControlOwnerOutcome.REJECTED:
+            if effect_ref is not None or result not in {
+                "run_not_active",
+                "migration_write_disabled",
+            }:
+                raise MonitorControlServiceError("OWNER_EFFECT_REFERENCE_MISMATCH")
+        else:
             raise MonitorControlServiceError("INVALID_EFFECT_RESULT")
         return
 

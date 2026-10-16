@@ -381,6 +381,63 @@ def test_submit_claim_owner_result_and_exact_retry_are_one_durable_flow(tmp_path
     assert ledger.get("freeze-1").outcome == ControlOwnerOutcome.APPLIED.value
 
 
+def test_stop_new_migration_disabled_rejection_is_a_durable_no_effect_result(
+    tmp_path: Path,
+) -> None:
+    actions = (ControlAction.STOP_NEW,)
+    verifier = _verifier(actions=actions)
+    ledger, service = _service(
+        tmp_path / "stop-new-migration-disabled.sqlite",
+        verifier=verifier,
+        binding_actions=frozenset(actions),
+    )
+    request = _request(
+        "stop-new-migration-disabled",
+        action=ControlAction.STOP_NEW,
+    )
+    pending = _handle(service, "monitor.control", request)
+    assert pending["status"] == ControlStatus.PENDING.value
+
+    claimed = _handle(
+        service,
+        "monitor.claim",
+        {"schema_version": 2, "command_id": "stop-new-migration-disabled"},
+        identity=_owner(),
+    )
+    assert claimed["claimed"] is True
+
+    rejected = _handle(
+        service,
+        "monitor.acknowledge",
+        {
+            "schema_version": 2,
+            "command_id": "stop-new-migration-disabled",
+            "outcome": ControlOwnerOutcome.REJECTED.value,
+            "effect_ref": None,
+            "effect_result": {
+                "action": "stop_new",
+                "result": "migration_write_disabled",
+            },
+        },
+        identity=_owner(),
+    )
+    assert rejected["status"] == ControlStatus.REJECTED.value
+    assert rejected["outcome"] == ControlOwnerOutcome.REJECTED.value
+    assert rejected["owner_final"] is True
+    assert rejected["effect_ref"] is None
+    assert rejected["effect_result"] == {
+        "action": "stop_new",
+        "result": "migration_write_disabled",
+    }
+    assert rejected["reconciliation_required"] is False
+    assert ledger.get("stop-new-migration-disabled").status is ControlStatus.REJECTED
+    assert _handle(
+        service,
+        "monitor.control_status",
+        {"schema_version": 1, "command_id": "stop-new-migration-disabled"},
+    ) == rejected
+
+
 def test_exact_wire_delegation_scope_and_verified_action_bind_before_write(tmp_path: Path) -> None:
     verifier = _verifier(actions=(ControlAction.FREEZE, ControlAction.DRAIN))
     ledger, service = _service(tmp_path / "bindings.sqlite", verifier=verifier)

@@ -52,6 +52,7 @@ class ControlAction(str, Enum):
     """The supported monitor-to-owner commands."""
 
     FREEZE = "freeze"
+    STOP_NEW = "stop_new"
     DRAIN = "drain"
     RESUME = "resume"
 
