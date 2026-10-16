@@ -35,7 +35,9 @@ from bt_api_monitor.service_control import (
     MONITOR_CONTROL_OWNER_PORT,
     MONITOR_CONTROL_PORT_OPERATIONS,
     MONITOR_CONTROL_PUBLIC_PORT,
+    MONITOR_CONTROL_PUBLIC_OPERATIONS,
     MONITOR_CONTROL_SUBMIT_OPERATIONS,
+    MONITOR_CONTROL_STATUS_OPERATIONS,
     MonitorControlService,
     MonitorControlServiceError,
     MonitorControlTarget,
@@ -555,16 +557,96 @@ def test_control_role_requires_only_public_submit_bind_and_known_operations() ->
         {"monitor.claim", "monitor.acknowledge"}
     ) == MONITOR_CONTROL_OWNER_OPERATIONS
     assert MONITOR_CONTROL_OPERATIONS == (
-        MONITOR_CONTROL_SUBMIT_OPERATIONS | MONITOR_CONTROL_OWNER_OPERATIONS
+        MONITOR_CONTROL_PUBLIC_OPERATIONS | MONITOR_CONTROL_OWNER_OPERATIONS
     )
     assert dict(MONITOR_CONTROL_PORT_OPERATIONS) == {
-        "service.monitor_control": MONITOR_CONTROL_SUBMIT_OPERATIONS,
+        "service.monitor_control": MONITOR_CONTROL_PUBLIC_OPERATIONS,
         "service.owner_control": MONITOR_CONTROL_OWNER_OPERATIONS,
     }
+    assert MONITOR_CONTROL_PUBLIC_OPERATIONS == (
+        MONITOR_CONTROL_SUBMIT_OPERATIONS | MONITOR_CONTROL_STATUS_OPERATIONS
+    )
     _error(
         "INVALID_BIND_PORTS",
         lambda: validate_service_options(
             {"role": "control"}, (MONITOR_CONTROL_OWNER_PORT,)
+        ),
+    )
+
+
+def test_control_status_is_private_to_the_exact_application_caller(tmp_path: Path) -> None:
+    caller = _caller()
+    foreign_caller = WireIdentity(
+        WireRole.APPLICATION_CLIENT,
+        caller.principal_ref,
+        caller.actor_ref,
+        "operator-delegation:another-user",
+    )
+    ledger = DurableControlLedger(tmp_path / "caller-private-status.sqlite", clock=MutableClock())
+    ingress = ControlIngress(ledger, _verifier(), clock=MutableClock())
+    caller_binding = ControlCommandBinding(
+        issuer=ISSUER,
+        account_id=ACCOUNT_ID,
+        mode=MODE,
+        scope=COMMAND_SCOPE,
+        actions=frozenset({ControlAction.FREEZE}),
+    )
+    foreign_binding = ControlCommandBinding(
+        issuer="operator:desk-b",
+        account_id=ACCOUNT_ID,
+        mode=MODE,
+        scope=COMMAND_SCOPE,
+        actions=frozenset({ControlAction.FREEZE}),
+    )
+    target = MonitorControlTarget(
+        ingress=ingress,
+        caller_bindings={caller: caller_binding, foreign_caller: foreign_binding},
+        owner_identity=_owner(),
+        executor_id="account-owner:17",
+    )
+    service = MonitorControlService({_scope(): target})
+    arguments = _request("caller-private-status")
+    _handle(service, "monitor.control", arguments, identity=caller)
+    claim = _handle(
+        service,
+        "monitor.claim",
+        {"schema_version": 2, "command_id": "caller-private-status"},
+        identity=_owner(),
+    )
+    assert claim["claimed"] is True
+    row = ledger.get("caller-private-status")
+    assert row is not None
+    cause_id = monitor_freeze_cause_id(row.command)
+    _handle(
+        service,
+        "monitor.acknowledge",
+        {
+            "schema_version": 2,
+            "command_id": "caller-private-status",
+            "outcome": "applied",
+            "effect_ref": cause_id,
+            "effect_result": {
+                "action": "freeze",
+                "cause_id": cause_id,
+                "risk_state": "active",
+            },
+        },
+        identity=_owner(),
+    )
+    status = _handle(
+        service,
+        "monitor.control_status",
+        {"schema_version": 1, "command_id": "caller-private-status"},
+        identity=caller,
+    )
+    assert status["status"] == ControlStatus.ACKNOWLEDGED.value
+    _error(
+        "COMMAND_NOT_FOUND",
+        lambda: _handle(
+            service,
+            "monitor.control_status",
+            {"schema_version": 1, "command_id": "caller-private-status"},
+            identity=foreign_caller,
         ),
     )
     _error(

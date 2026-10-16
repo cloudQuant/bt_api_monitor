@@ -45,8 +45,12 @@ from .service_component import (
 )
 
 MONITOR_CONTROL_SUBMIT_OPERATIONS = frozenset({"monitor.control"})
+MONITOR_CONTROL_STATUS_OPERATIONS = frozenset({"monitor.control_status"})
+MONITOR_CONTROL_PUBLIC_OPERATIONS = MONITOR_CONTROL_SUBMIT_OPERATIONS.union(
+    MONITOR_CONTROL_STATUS_OPERATIONS
+)
 MONITOR_CONTROL_OWNER_OPERATIONS = frozenset({"monitor.claim", "monitor.acknowledge"})
-MONITOR_CONTROL_OPERATIONS = MONITOR_CONTROL_SUBMIT_OPERATIONS.union(
+MONITOR_CONTROL_OPERATIONS = MONITOR_CONTROL_PUBLIC_OPERATIONS.union(
     MONITOR_CONTROL_OWNER_OPERATIONS
 )
 
@@ -54,6 +58,7 @@ MONITOR_CONTROL_PUBLIC_PORT = "service.monitor_control"
 MONITOR_CONTROL_OWNER_PORT = "service.owner_control"
 _CONTROL_OPTIONS = frozenset({"role"})
 _SUBMIT_FIELDS = frozenset({"schema_version", "payload_b64", "signature_b64"})
+_STATUS_FIELDS = frozenset({"schema_version", "command_id"})
 _CLAIM_FIELDS_V1 = frozenset({"schema_version"})
 _CLAIM_FIELDS_V2 = frozenset({"schema_version", "command_id"})
 _ACKNOWLEDGE_FIELDS_V1 = frozenset({"schema_version", "command_id", "outcome"})
@@ -66,7 +71,7 @@ _MAX_CONTROL_TEXT_BYTES = 256
 
 MONITOR_CONTROL_PORT_OPERATIONS = MappingProxyType(
     {
-        MONITOR_CONTROL_PUBLIC_PORT: MONITOR_CONTROL_SUBMIT_OPERATIONS,
+        MONITOR_CONTROL_PUBLIC_PORT: MONITOR_CONTROL_PUBLIC_OPERATIONS,
         MONITOR_CONTROL_OWNER_PORT: MONITOR_CONTROL_OWNER_OPERATIONS,
     }
 )
@@ -110,6 +115,7 @@ class MonitorControlTarget:
         _validate_text(self.executor_id, "INVALID_TARGET")
 
         copied: dict[WireIdentity, ControlCommandBinding] = {}
+        caller_issuers: set[str] = set()
         route: tuple[str, str, str] | None = None
         for identity, binding in self.caller_bindings.items():
             if (
@@ -123,6 +129,12 @@ class MonitorControlTarget:
             _validate_text(binding.account_id, "INVALID_TARGET")
             _validate_text(binding.mode, "INVALID_TARGET")
             _validate_text(binding.scope, "INVALID_TARGET")
+            # The durable command row records its issuer, not its submitter's
+            # wire identity. Keep issuer authority one-to-one with application
+            # callers on a route so a status lookup cannot cross user identity.
+            if binding.issuer in caller_issuers:
+                raise MonitorControlServiceError("CALLER_ISSUER_NOT_UNIQUE")
+            caller_issuers.add(binding.issuer)
             binding_route = (binding.account_id, binding.mode, binding.scope)
             if route is None:
                 route = binding_route
@@ -214,11 +226,50 @@ class MonitorControlService:
 
         if operation in self.SUBMIT_OPERATIONS:
             return self._submit(target, identity, arguments)
+        if operation in MONITOR_CONTROL_STATUS_OPERATIONS:
+            return self._status_for_caller(target, identity, arguments)
         if identity.role is not WireRole.SERVICE or identity != target.owner_identity:
             raise MonitorControlServiceError("OWNER_IDENTITY_REQUIRED")
         if operation == "monitor.claim":
             return self._claim(target, arguments)
         return self._acknowledge(target, arguments)
+
+    def _status_for_caller(
+        self,
+        target: MonitorControlTarget,
+        identity: WireIdentity,
+        arguments: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Read one persisted row only for its exact authorized application caller."""
+
+        if identity.role is not WireRole.APPLICATION_CLIENT:
+            raise MonitorControlServiceError("APPLICATION_ROLE_REQUIRED")
+        binding = target.caller_bindings.get(identity)
+        if binding is None:
+            raise MonitorControlServiceError("CALLER_DELEGATION_NOT_GRANTED")
+        values = _parse_fields(arguments, _STATUS_FIELDS)
+        _require_schema_v1(values)
+        command_id = values["command_id"]
+        _validate_text(command_id, "INVALID_COMMAND_ID")
+        try:
+            result = target.ingress.ledger.get(command_id)
+        except Exception:
+            raise MonitorControlServiceError("CONTROL_STATUS_READ_FAILED") from None
+        if result is None:
+            raise MonitorControlServiceError("COMMAND_NOT_FOUND")
+        _validate_ledger_result(result, target, expected_executor=None)
+        command = result.command
+        if (
+            command.issuer != binding.issuer
+            or command.account_id != binding.account_id
+            or command.mode != binding.mode
+            or command.scope != binding.scope
+            or command.action not in binding.actions
+        ):
+            # Do not distinguish an absent command from one owned by another
+            # caller, even when both callers share this service scope.
+            raise MonitorControlServiceError("COMMAND_NOT_FOUND")
+        return _command_status(result)
 
     def _submit(
         self,
@@ -710,7 +761,9 @@ __all__ = [
     "MONITOR_CONTROL_OWNER_PORT",
     "MONITOR_CONTROL_PORT_OPERATIONS",
     "MONITOR_CONTROL_PUBLIC_PORT",
+    "MONITOR_CONTROL_PUBLIC_OPERATIONS",
     "MONITOR_CONTROL_SUBMIT_OPERATIONS",
+    "MONITOR_CONTROL_STATUS_OPERATIONS",
     "MonitorControlService",
     "MonitorControlServiceError",
     "MonitorControlTarget",
