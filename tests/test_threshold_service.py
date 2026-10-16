@@ -4,12 +4,13 @@ import json
 import sqlite3
 
 import pytest
-from bt_api_base.service_protocol import WireScope
+from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from bt_api_monitor.durable import (
     DurableOutbox,
     OutboxDeliveryError,
     OutboxEvent,
+    SequencedOutboxEvent,
 )
 from bt_api_monitor.service_ingress import MonitorIngressTarget
 from bt_api_monitor.threshold_rules import (
@@ -18,6 +19,7 @@ from bt_api_monitor.threshold_rules import (
     ThresholdRuleCapacityError,
     ThresholdRuleError,
     ThresholdRuleStoragePolicy,
+    _matches_rule_event,
 )
 from bt_api_monitor.threshold_service import (
     THRESHOLD_ALERT_EVENT_TYPE,
@@ -104,6 +106,130 @@ def test_operator_config_derives_exact_scope_and_rejects_request_scope_fields() 
     with pytest.raises(ThresholdServiceError) as error:
         parse_threshold_service_config(json.dumps(raw), {"target-a": _TARGET_A})
     assert error.value.code == "RULE_FIELDS_INVALID"
+
+
+def test_execution_business_selector_binds_operator_identity_and_exact_scope() -> None:
+    producer = WireIdentity(WireRole.SERVICE, "service:execution-relay", "relay-a")
+    scope = WireScope(_DOMAIN, account_ref="account-a", strategy_ref="strategy-a")
+    target = TrustedThresholdTarget(
+        "target-a",
+        scope,
+        MonitorIngressTarget(
+            "execution-monitor:account-a:strategy-a",
+            ("execution.lifecycle", "execution.cancellation"),
+        ),
+        producer_identity=producer,
+        source_provider="binance",
+        source_environment="paper",
+    )
+    raw = _config(event_type="execution.lifecycle")
+    rule = raw["rules"][0]
+    rule["dimension_fields"] = ["account_ref", "strategy_ref"]
+    rule["execution_event_selector"] = {
+        "schema": "sdk.execution_monitor_projection.v2",
+        "stream": "execution",
+        "business_event_type": "intent_recorded",
+        "state": "PENDING_ADMISSION",
+    }
+
+    parsed = parse_threshold_service_config(json.dumps(raw), {"target-a": target})
+    selector = parsed.rules[0].execution_event_selector
+    assert selector is not None
+    assert selector.producer == producer
+    assert (selector.source_provider, selector.source_environment) == (
+        "binance",
+        "paper",
+    )
+    assert (selector.account_ref, selector.strategy_ref) == ("account-a", "strategy-a")
+    assert (selector.stream, selector.business_event_type, selector.state) == (
+        "execution",
+        "intent_recorded",
+        "PENDING_ADMISSION",
+    )
+
+    def projected_event(*, provider: str = "binance", environment: str = "paper"):
+        payload = {
+            "schema": "sdk.execution_monitor_projection.v2",
+            "journal_generation": "journal-generation-1",
+            "stream": "execution",
+            "source_sequence": 1,
+            "source_event_id": "execution-event-1",
+            "source_created_at_ns": 1_700_000_000_000_000_000,
+            "source_scope_key": "execution-scope-key",
+            "source_scope": {
+                "provider": provider,
+                "environment": environment,
+                "account_ref": "account-a",
+                "strategy_id": "strategy-a",
+                "trading_day": None,
+            },
+            "business_event_type": "intent_recorded",
+            "state": "PENDING_ADMISSION",
+            "intent_id": "intent-1",
+            "cancel_id": None,
+            "target_intent_id": None,
+        }
+        event = OutboxEvent(
+            event_id="monitor-event-1",
+            scope=target.ingress_target.outbox_scope,
+            event_type="execution.lifecycle",
+            data={
+                "producer": {
+                    "role": "service",
+                    "principal_ref": producer.principal_ref,
+                    "actor_ref": producer.actor_ref,
+                    "delegate_ref": producer.delegate_ref,
+                },
+                "source_event_id": "monitor-event-1",
+                "payload": payload,
+            },
+            occurred_at=1_700_000_000.0,
+        )
+        return SequencedOutboxEvent(1, event)
+
+    assert _matches_rule_event(parsed.rules[0], projected_event()) is True
+    for source_override in (
+        {"provider": "other-provider"},
+        {"environment": "live"},
+    ):
+        with pytest.raises(ThresholdRuleError, match="source scope does not match"):
+            _matches_rule_event(
+                parsed.rules[0], projected_event(**source_override)
+            )
+
+    forged = json.loads(json.dumps(raw))
+    forged["rules"][0]["execution_event_selector"]["producer"] = {
+        "principal_ref": "client-chosen"
+    }
+    with pytest.raises(ThresholdServiceError) as producer_fields:
+        parse_threshold_service_config(json.dumps(forged), {"target-a": target})
+    assert producer_fields.value.code == "RULE_EXECUTION_SELECTOR_INVALID"
+
+    with pytest.raises(ThresholdServiceError) as missing_producer:
+        parse_threshold_service_config(
+            json.dumps(raw),
+            {
+                "target-a": TrustedThresholdTarget(
+                    "target-a", scope, target.ingress_target
+                )
+            },
+        )
+    assert missing_producer.value.code == "RULE_EXECUTION_PRODUCER_NOT_TRUSTED"
+
+    missing_source_scope = TrustedThresholdTarget(
+        "target-a", scope, target.ingress_target, producer_identity=producer
+    )
+    with pytest.raises(ThresholdServiceError) as source_scope_not_trusted:
+        parse_threshold_service_config(json.dumps(raw), {"target-a": missing_source_scope})
+    assert source_scope_not_trusted.value.code == "RULE_EXECUTION_SOURCE_SCOPE_NOT_TRUSTED"
+
+    wrong_business_fact = json.loads(json.dumps(raw))
+    wrong_business_fact["rules"][0]["execution_event_selector"]["business_event_type"] = (
+        "intent_state_changed"
+    )
+    with pytest.raises(ThresholdServiceError) as unsupported_fact:
+        parse_threshold_service_config(json.dumps(wrong_business_fact), {"target-a": target})
+    assert unsupported_fact.value.code == "RULE_EXECUTION_SELECTOR_INVALID"
 
 
 def test_operator_config_rejects_alert_feedback_and_global_budget_overflow() -> None:

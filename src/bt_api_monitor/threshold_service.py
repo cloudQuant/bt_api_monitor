@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Callable
 
-from bt_api_base.service_protocol import WireScope
+from bt_api_base.service_protocol import WireIdentity, WireRole, WireScope
 
 from .durable import (
     MAX_OUTBOX_CAPACITY_BYTES,
@@ -37,6 +37,7 @@ from .threshold_rules import (
     ThresholdRule,
     ThresholdRuleError,
     ThresholdRuleStoragePolicy,
+    TrustedExecutionEventSelector,
 )
 
 THRESHOLD_ALERT_EVENT_TYPE = "monitor.threshold_alert.v1"
@@ -80,6 +81,10 @@ _RULE_FIELDS = frozenset(
         "trading_day_field",
     }
 )
+_RULE_SELECTOR_FIELDS = _RULE_FIELDS | {"execution_event_selector"}
+_EXECUTION_SELECTOR_FIELDS = frozenset(
+    {"schema", "stream", "business_event_type", "state"}
+)
 _SAFE_REF_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
 
 
@@ -93,16 +98,29 @@ class ThresholdServiceError(RuntimeError):
 
 @dataclass(frozen=True)
 class TrustedThresholdTarget:
-    """One operator-owned exact account/strategy binding for Monitor ingress."""
+    """One operator-owned Monitor target and optional exact source binding."""
 
     target_ref: str
     scope: WireScope
     ingress_target: MonitorIngressTarget
+    producer_identity: WireIdentity | None = None
+    source_provider: str | None = None
+    source_environment: str | None = None
 
     def __post_init__(self) -> None:
         _validate_ref(self.target_ref, "INVALID_TRUSTED_TARGET")
         if type(self.scope) is not WireScope or type(self.ingress_target) is not MonitorIngressTarget:
             raise ThresholdServiceError("INVALID_TRUSTED_TARGET")
+        if self.producer_identity is not None and (
+            type(self.producer_identity) is not WireIdentity
+            or self.producer_identity.role is not WireRole.SERVICE
+        ):
+            raise ThresholdServiceError("INVALID_TRUSTED_PRODUCER")
+        if (self.source_provider is None) != (self.source_environment is None):
+            raise ThresholdServiceError("INVALID_TRUSTED_SOURCE_SCOPE")
+        if self.source_provider is not None:
+            _validate_ref(self.source_provider, "INVALID_TRUSTED_SOURCE_SCOPE")
+            _validate_ref(self.source_environment, "INVALID_TRUSTED_SOURCE_SCOPE")
         if (
             not self.scope.execution_domain_ref
             or not self.scope.account_ref
@@ -221,7 +239,10 @@ def parse_threshold_service_config(
     window_event_budget = 0
     label_budget = 0
     for item in raw_rules:
-        if type(item) is not dict or set(item) != _RULE_FIELDS:
+        if type(item) is not dict or frozenset(item) not in {
+            _RULE_FIELDS,
+            _RULE_SELECTOR_FIELDS,
+        }:
             raise ThresholdServiceError("RULE_FIELDS_INVALID")
         target_ref = item["target_ref"]
         _validate_ref(target_ref, "RULE_TARGET_INVALID")
@@ -238,6 +259,51 @@ def parse_threshold_service_config(
         dimensions = item["dimension_fields"]
         if type(dimensions) is not list or any(type(field) is not str for field in dimensions):
             raise ThresholdServiceError("RULE_DIMENSIONS_INVALID")
+        event_selector = None
+        if "execution_event_selector" in item:
+            raw_selector = item["execution_event_selector"]
+            if type(raw_selector) is not dict or set(raw_selector) != _EXECUTION_SELECTOR_FIELDS:
+                raise ThresholdServiceError("RULE_EXECUTION_SELECTOR_INVALID")
+            if target.producer_identity is None:
+                raise ThresholdServiceError("RULE_EXECUTION_PRODUCER_NOT_TRUSTED")
+            if target.source_provider is None or target.source_environment is None:
+                raise ThresholdServiceError("RULE_EXECUTION_SOURCE_SCOPE_NOT_TRUSTED")
+            if (
+                target.scope.run_id is not None
+                or target.scope.manual_book_ref is not None
+                or target.scope.portfolio_ref is not None
+            ):
+                raise ThresholdServiceError("RULE_EXECUTION_SCOPE_NOT_EXACT")
+            stream = raw_selector["stream"]
+            if type(stream) is not str:
+                raise ThresholdServiceError("RULE_EXECUTION_SELECTOR_INVALID")
+            expected_event_type = {
+                "execution": "execution.lifecycle",
+                "cancellation": "execution.cancellation",
+            }.get(stream)
+            if (
+                raw_selector["schema"] != "sdk.execution_monitor_projection.v2"
+                or expected_event_type is None
+                or expected_event_type != event_type
+                or type(raw_selector["business_event_type"]) is not str
+                or type(raw_selector["state"]) is not str
+            ):
+                raise ThresholdServiceError("RULE_EXECUTION_SELECTOR_INVALID")
+            try:
+                event_selector = TrustedExecutionEventSelector(
+                    stream=stream,
+                    business_event_type=raw_selector["business_event_type"],
+                    state=raw_selector["state"],
+                    producer=target.producer_identity,
+                    source_provider=target.source_provider,
+                    source_environment=target.source_environment,
+                    account_ref=target.scope.account_ref or "",
+                    strategy_ref=target.scope.strategy_ref or "",
+                )
+            except ThresholdRuleError:
+                raise ThresholdServiceError("RULE_EXECUTION_SELECTOR_INVALID") from None
+            if dimensions != ["account_ref", "strategy_ref"]:
+                raise ThresholdServiceError("RULE_EXECUTION_DIMENSIONS_REQUIRED")
         try:
             rule = ThresholdRule(
                 rule_id=item["rule_id"],
@@ -252,6 +318,7 @@ def parse_threshold_service_config(
                 allowed_lateness_seconds=item["allowed_lateness_seconds"],
                 late_event_policy=item["late_event_policy"],
                 trading_day_field=item["trading_day_field"],
+                execution_event_selector=event_selector,
             )
         except ThresholdRuleError:
             raise ThresholdServiceError("RULE_INVALID") from None

@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from datetime import date
 from types import MappingProxyType
 
+from bt_api_base.service_protocol import WireIdentity, WireRole
+
 from .durable import (
     DurableOutbox,
     DurableOutboxConsumer,
@@ -62,6 +64,7 @@ MAX_PERSISTED_ALERT_ROWS = 100_000
 MAX_ALERT_RETENTION_SECONDS = 90 * 24 * 60 * 60
 DEFAULT_ALERT_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _SOURCE_COMPLETENESS_EVENT_ONLY = "received_event_only"
+_EXECUTION_PROJECTION_SCHEMA = "sdk.execution_monitor_projection.v2"
 _ALERT_ID_DOMAIN = "bt-api-monitor.threshold-alert.v2"
 _MAX_RULE_ID_BYTES = 128
 _MAX_SCOPE_TEXT_BYTES = 256
@@ -129,6 +132,50 @@ DEFAULT_THRESHOLD_STORAGE_POLICY = ThresholdRuleStoragePolicy()
 
 
 @dataclass(frozen=True)
+class TrustedExecutionEventSelector:
+    """Operator-bound selector for one durable execution admission fact.
+
+    Rule JSON chooses only one of the supported facts. Producer identity and
+    the exact provider/environment/account/strategy source scope are injected
+    from an operator-owned trusted target and persisted as part of the rule's
+    versioned semantics. Only account and strategy are metric dimensions.
+    """
+
+    stream: str
+    business_event_type: str
+    state: str
+    producer: WireIdentity
+    source_provider: str
+    source_environment: str
+    account_ref: str
+    strategy_ref: str
+
+    def __post_init__(self) -> None:
+        allowed = {
+            ("execution", "intent_recorded", "PENDING_ADMISSION"),
+            ("cancellation", "cancel_intent_recorded", "PENDING_ADMISSION"),
+        }
+        if (self.stream, self.business_event_type, self.state) not in allowed:
+            raise ThresholdRuleError("execution event selector is not supported")
+        if (
+            type(self.producer) is not WireIdentity
+            or self.producer.role is not WireRole.SERVICE
+        ):
+            raise ThresholdRuleError("execution event selector requires a service producer")
+        for name, value in (
+            ("producer principal", self.producer.principal_ref),
+            ("producer actor", self.producer.actor_ref),
+            ("source provider", self.source_provider),
+            ("source environment", self.source_environment),
+            ("account_ref", self.account_ref),
+            ("strategy_ref", self.strategy_ref),
+        ):
+            _validate_scoped_text(name, value, 256)
+        if self.producer.delegate_ref is not None:
+            _validate_scoped_text("producer delegate", self.producer.delegate_ref, 256)
+
+
+@dataclass(frozen=True)
 class ThresholdRule:
     """One exact scope/event-type rule with immutable, explicitly versioned semantics.
 
@@ -151,6 +198,7 @@ class ThresholdRule:
     allowed_lateness_seconds: float = 0.0
     late_event_policy: str = "ignore"
     trading_day_field: str | None = None
+    execution_event_selector: TrustedExecutionEventSelector | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -217,6 +265,27 @@ class ThresholdRule:
             raise ThresholdRuleError("late_event_policy must be ignore or reject")
         if self.trading_day_field is not None and self.trading_day_field != "trading_day":
             raise ThresholdRuleError("trading_day_field must be the explicit trading_day field")
+        if self.execution_event_selector is not None:
+            selector = self.execution_event_selector
+            if type(selector) is not TrustedExecutionEventSelector:
+                raise ThresholdRuleError("execution_event_selector must be trusted")
+            expected_outer_type = (
+                "execution.lifecycle"
+                if selector.stream == "execution"
+                else "execution.cancellation"
+            )
+            if self.event_type != expected_outer_type:
+                raise ThresholdRuleError(
+                    "execution selector does not match its projected event type"
+                )
+            if self.dimension_fields != ("account_ref", "strategy_ref"):
+                raise ThresholdRuleError(
+                    "execution selector requires trusted account and strategy dimensions"
+                )
+            if self.max_dimension_keys != 1:
+                raise ThresholdRuleError(
+                    "execution selector is bound to one exact account/strategy key"
+                )
 
 
 @dataclass(frozen=True)
@@ -469,7 +538,7 @@ class ScopedThresholdRuleLoop:
                 raise ThresholdRuleError("source event sequence is not the next scoped fact")
 
             late_events = int(progress["late_events"])
-            if item.event.event_type == rule.event_type:
+            if _matches_rule_event(rule, item):
                 dimensions = _dimension_values(rule, item)
                 dimension_json = _canonical_json(dict(dimensions))
                 dimension_key = _sha256(dimension_json.encode("utf-8"))
@@ -1175,30 +1244,153 @@ def _storage_policy_json(policy: ThresholdRuleStoragePolicy) -> str:
 
 
 def _rule_config_json(rule: ThresholdRule) -> str:
-    return _canonical_json(
-        {
-            "allowed_lateness_seconds": float(rule.allowed_lateness_seconds),
-            "count_unit": "one_per_unique_outbox_sequence",
-            "dimension_fields": list(rule.dimension_fields),
-            "event_time_basis": "outbox.occurred_at_utc_epoch_seconds",
-            "event_type": rule.event_type,
-            "late_event_policy": rule.late_event_policy,
-            "max_dimension_keys": rule.max_dimension_keys,
-            "max_window_events": rule.max_window_events,
-            "outbox_scope": rule.outbox_scope,
-            "rule_id": rule.rule_id,
-            "rule_version": rule.rule_version,
-            "threshold_count": rule.threshold_count,
-            "trading_day_field": rule.trading_day_field,
-            "trading_day_policy": (
-                "reset_forward_iso_day_reject_or_ignore_regression"
-                if rule.trading_day_field is not None
-                else "continuous_no_trading_day_partition"
-            ),
-            "window_boundary": "inclusive_event_time_gte_watermark_minus_window",
-            "window_seconds": float(rule.window_seconds),
+    config = {
+        "allowed_lateness_seconds": float(rule.allowed_lateness_seconds),
+        "count_unit": "one_per_unique_outbox_sequence",
+        "dimension_fields": list(rule.dimension_fields),
+        "event_time_basis": "outbox.occurred_at_utc_epoch_seconds",
+        "event_type": rule.event_type,
+        "late_event_policy": rule.late_event_policy,
+        "max_dimension_keys": rule.max_dimension_keys,
+        "max_window_events": rule.max_window_events,
+        "outbox_scope": rule.outbox_scope,
+        "rule_id": rule.rule_id,
+        "rule_version": rule.rule_version,
+        "threshold_count": rule.threshold_count,
+        "trading_day_field": rule.trading_day_field,
+        "trading_day_policy": (
+            "reset_forward_iso_day_reject_or_ignore_regression"
+            if rule.trading_day_field is not None
+            else "continuous_no_trading_day_partition"
+        ),
+        "window_boundary": "inclusive_event_time_gte_watermark_minus_window",
+        "window_seconds": float(rule.window_seconds),
+    }
+    selector = rule.execution_event_selector
+    if selector is not None:
+        config["execution_event_selector"] = {
+            "business_event_type": selector.business_event_type,
+            "producer": {
+                "actor_ref": selector.producer.actor_ref,
+                "delegate_ref": selector.producer.delegate_ref,
+                "principal_ref": selector.producer.principal_ref,
+                "role": selector.producer.role.value,
+            },
+            "schema": _EXECUTION_PROJECTION_SCHEMA,
+            "scope": {
+                "account_ref": selector.account_ref,
+                "environment": selector.source_environment,
+                "provider": selector.source_provider,
+                "strategy_ref": selector.strategy_ref,
+            },
+            "state": selector.state,
+            "stream": selector.stream,
         }
-    )
+    return _canonical_json(config)
+
+
+def _matches_rule_event(rule: ThresholdRule, item: SequencedOutboxEvent) -> bool:
+    """Match one outer event and, when configured, its trusted business fact.
+
+    Unrelated event kinds and events from a different authenticated producer
+    are ordinary nonmatches and still advance the durable consumer. A
+    malformed projection from the trusted producer fails closed, leaving the
+    source sequence pending for operator repair.
+    """
+
+    if item.event.event_type != rule.event_type:
+        return False
+    selector = rule.execution_event_selector
+    if selector is None:
+        return True
+
+    data = item.event.data
+    producer = data.get("producer")
+    expected_producer = {
+        "role": selector.producer.role.value,
+        "principal_ref": selector.producer.principal_ref,
+        "actor_ref": selector.producer.actor_ref,
+        "delegate_ref": selector.producer.delegate_ref,
+    }
+    if not isinstance(producer, Mapping) or dict(producer) != expected_producer:
+        return False
+    if set(data) != {"producer", "source_event_id", "payload"}:
+        raise ThresholdRuleError("trusted execution ingress envelope is invalid")
+    _validate_lineage_text("projected source event ID", data["source_event_id"], 256)
+
+    payload = data["payload"]
+    projection_fields = {
+        "schema",
+        "journal_generation",
+        "stream",
+        "source_sequence",
+        "source_event_id",
+        "source_created_at_ns",
+        "source_scope_key",
+        "source_scope",
+        "business_event_type",
+        "state",
+        "intent_id",
+        "cancel_id",
+        "target_intent_id",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != projection_fields:
+        raise ThresholdRuleError("trusted execution projection is invalid")
+    if payload.get("schema") != _EXECUTION_PROJECTION_SCHEMA or payload.get(
+        "stream"
+    ) != selector.stream:
+        raise ThresholdRuleError("trusted execution projection binding changed")
+    _validate_lineage_text("journal generation", payload.get("journal_generation"), 128)
+    _validate_lineage_text("source scope key", payload.get("source_scope_key"), 128)
+    _validate_lineage_text("source event ID", payload.get("source_event_id"), 256)
+    if type(payload.get("source_sequence")) is not int or payload["source_sequence"] <= 0:
+        raise ThresholdRuleError("trusted execution source cursor is invalid")
+    created_at_ns = payload.get("source_created_at_ns")
+    if type(created_at_ns) is not int or created_at_ns <= 0:
+        raise ThresholdRuleError("trusted execution source time is invalid")
+    if item.event.occurred_at != created_at_ns / 1_000_000_000:
+        raise ThresholdRuleError("trusted execution event time does not match its source")
+
+    source_scope = payload.get("source_scope")
+    if not isinstance(source_scope, Mapping) or set(source_scope) != {
+        "provider",
+        "environment",
+        "account_ref",
+        "strategy_id",
+        "trading_day",
+    }:
+        raise ThresholdRuleError("trusted execution source scope is invalid")
+    _validate_lineage_text("source provider", source_scope.get("provider"), 128)
+    _validate_lineage_text("source environment", source_scope.get("environment"), 128)
+    if (
+        source_scope.get("provider") != selector.source_provider
+        or source_scope.get("environment") != selector.source_environment
+        or source_scope.get("account_ref") != selector.account_ref
+        or source_scope.get("strategy_id") != selector.strategy_ref
+    ):
+        raise ThresholdRuleError("trusted execution source scope does not match")
+    if source_scope.get("trading_day") is not None:
+        _validate_lineage_text("source trading day", source_scope["trading_day"], 128)
+
+    business_event_type = payload.get("business_event_type")
+    state = payload.get("state")
+    _validate_lineage_text("business event type", business_event_type, 128)
+    _validate_lineage_text("business event state", state, 128)
+    if (
+        business_event_type != selector.business_event_type
+        or state != selector.state
+    ):
+        return False
+    if selector.stream == "execution":
+        _validate_lineage_text("intent ID", payload.get("intent_id"), 256)
+        if payload.get("cancel_id") is not None or payload.get("target_intent_id") is not None:
+            raise ThresholdRuleError("trusted execution intent reference shape is invalid")
+    else:
+        _validate_lineage_text("cancel ID", payload.get("cancel_id"), 256)
+        _validate_lineage_text("target intent ID", payload.get("target_intent_id"), 256)
+        if payload.get("intent_id") is not None:
+            raise ThresholdRuleError("trusted cancellation reference shape is invalid")
+    return True
 
 
 def _dimension_values(
@@ -1206,7 +1398,13 @@ def _dimension_values(
 ) -> tuple[tuple[str, str], ...]:
     values = []
     for field in rule.dimension_fields:
-        value = _source_data_value(item, field)
+        selector = rule.execution_event_selector
+        if selector is not None and field == "account_ref":
+            value = selector.account_ref
+        elif selector is not None and field == "strategy_ref":
+            value = selector.strategy_ref
+        else:
+            value = _source_data_value(item, field)
         if value is _MISSING:
             raise ThresholdRuleError("source event is missing a configured dimension")
         if field == "instrument_key" and isinstance(value, Mapping):
@@ -1235,7 +1433,17 @@ def _dimension_values(
 def _event_trading_day(rule: ThresholdRule, item: SequencedOutboxEvent) -> str | None:
     if rule.trading_day_field is None:
         return None
-    value = _source_data_value(item, rule.trading_day_field)
+    selector = rule.execution_event_selector
+    if selector is not None:
+        payload = item.event.data.get("payload")
+        source_scope = payload.get("source_scope") if isinstance(payload, Mapping) else None
+        value = (
+            source_scope.get("trading_day", _MISSING)
+            if isinstance(source_scope, Mapping)
+            else _MISSING
+        )
+    else:
+        value = _source_data_value(item, rule.trading_day_field)
     if type(value) is not str:
         raise ThresholdRuleError("source event requires an ISO trading_day")
     try:
@@ -1491,4 +1699,5 @@ __all__ = [
     "ThresholdRuleError",
     "ThresholdRuleStatus",
     "ThresholdRuleStoragePolicy",
+    "TrustedExecutionEventSelector",
 ]
