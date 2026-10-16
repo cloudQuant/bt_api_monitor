@@ -211,6 +211,78 @@ def test_alert_retention_prunes_only_delivered_rows_and_policy_is_pinned(tmp_pat
         )
 
 
+def test_alert_table_capacity_keeps_pending_alert_and_source_event_unacknowledged(
+    tmp_path,
+) -> None:
+    database = tmp_path / "threshold-alert-capacity.sqlite"
+    now = [30_000.0]
+    outbox = DurableOutbox(database, clock=lambda: now[0])
+    raw = _config(max_keys=2)
+    raw["storage_policy"]["max_alert_rows"] = 1
+    raw["rules"][0]["threshold_count"] = 1
+    raw["rules"][0]["max_window_events"] = 2
+    parsed = parse_threshold_service_config(json.dumps(raw), {"target-a": _TARGET_A})
+    sink_available = [False]
+    delivered = []
+
+    def sink(alert) -> None:
+        if not sink_available[0]:
+            raise RuntimeError("controlled sink outage")
+        delivered.append(alert)
+
+    first = outbox.append(_event("capacity-first", "contract-a", now[0]))
+    second = outbox.append(_event("capacity-second", "contract-b", now[0] + 1.0))
+    loop = ScopedThresholdRuleLoop(
+        outbox,
+        parsed.rules,
+        sink,
+        consumer_id=parsed.consumer_id,
+        clock=lambda: now[0],
+        storage_policy=parsed.storage_policy,
+    )
+
+    with pytest.raises(OutboxDeliveryError):
+        loop.run_once(limit=1)
+    assert loop.checkpoint(_TARGET_A.ingress_target.outbox_scope) == 0
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT alert_id, delivery_state FROM monitor_threshold_alert_outbox"
+        ).fetchone()
+    assert row is not None and row[1] == "PENDING"
+    first_alert_id = row[0]
+
+    # Pending alerts survive their retention age.  A successful retry settles
+    # the existing alert, but retained table capacity still blocks a different
+    # crossing until that delivered row ages out normally.
+    now[0] += parsed.storage_policy.alert_retention_seconds + 1
+    sink_available[0] = True
+    recovered = loop.run_once(limit=1)
+    assert [alert.alert_id for alert in recovered] == [first_alert_id]
+    assert [alert.alert_id for alert in delivered] == [first_alert_id]
+    assert loop.checkpoint(_TARGET_A.ingress_target.outbox_scope) == first.sequence
+
+    with pytest.raises(OutboxDeliveryError) as capacity_error:
+        loop.run_once(limit=1)
+    assert isinstance(capacity_error.value.__cause__, ThresholdRuleCapacityError)
+    assert loop.checkpoint(_TARGET_A.ingress_target.outbox_scope) == first.sequence
+    assert [
+        item.event.event_id
+        for item in outbox.read_pending(
+            parsed.consumer_id, _TARGET_A.ingress_target.outbox_scope, limit=2
+        )
+    ] == ["capacity-second"]
+    status = loop.rule_status(parsed.rules[0].rule_id)
+    assert status.alerts_triggered == 1
+    assert status.alerts_emitted == 1
+    assert status.pending_alerts == 0
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT alert_id, delivery_state FROM monitor_threshold_alert_outbox"
+        ).fetchall()
+    assert rows == [(first_alert_id, "DELIVERED")]
+    assert second.sequence > first.sequence
+
+
 def test_supervisor_close_retries_unconfirmed_process_and_pipe_cleanup(tmp_path) -> None:
     class Process:
         pid = 1234
