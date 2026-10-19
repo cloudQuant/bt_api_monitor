@@ -37,6 +37,10 @@ class _Provider:
         del handle
         return True
 
+    def poll(self, handle: object, *, limit: int) -> tuple[Any, ...]:
+        del handle, limit
+        return ()
+
 
 def _key() -> MarketSubscriptionKey:
     return MarketSubscriptionKey(
