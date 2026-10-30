@@ -5,6 +5,15 @@
 
 Performance monitoring system for the bt_api ecosystem. Provides real-time metrics collection, exchange health monitoring, and integrations with Prometheus, Grafana, and ELK stack.
 
+## System role and authority boundary
+
+`bt_api_monitor` owns operational telemetry and monitoring records: metrics,
+health and heartbeat views, and explicitly configured event or control-intake
+services. These are monitoring and control records, not authoritative account,
+order, position, or risk state. Recording a control command does not mean the
+account owner executed it. See the
+[Trading System Architecture](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
+
 ## Features
 
 ### Core Monitoring
