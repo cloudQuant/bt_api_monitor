@@ -226,16 +226,17 @@ def monitor_async_performance(
         @functools.wraps(func)
         async def wrapper(*args, **kwargs) -> Any:
             calls_counter.inc()
+            start_time = time.perf_counter()
 
             try:
-                start_time = time.perf_counter()
                 result = await func(*args, **kwargs)
-                duration = time.perf_counter() - start_time
-                duration_histogram.observe(duration)
                 return result
             except Exception:
                 errors_counter.inc()
                 raise
+            finally:
+                duration = time.perf_counter() - start_time
+                duration_histogram.observe(duration)
 
         wrapper._monitoring_metrics = {  # type: ignore[attr-defined]
             "duration": duration_histogram,

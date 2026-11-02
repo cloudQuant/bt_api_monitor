@@ -11,13 +11,14 @@ import time
 from pathlib import Path
 
 # Setup logging for production
-from bt_api_py.logging_system import get_logger, setup_logging_for_production
+from bt_api_base.logging_factory import get_logger
+from bt_api_base.logging_setup import setup_logging_for_production
 
-setup_logging_for_production()
+setup_logging_for_production("logs/bt_api_py.log")
 logger = get_logger(__name__)
 
 # Setup monitoring
-from bt_api_py.monitoring import (
+from bt_api_monitor import (
     counter,
     gauge,
     get_business_collector,

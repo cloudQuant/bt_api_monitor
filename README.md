@@ -14,6 +14,12 @@ order, position, or risk state. Recording a control command does not mean the
 account owner executed it. See the
 [Trading System Architecture](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
 
+The working-tree Logstash formatter reads shared context identifiers from `bt_api_base.logging_context`, and Monitor configuration uses `bt_api_base.logging_setup`; this cross-package source change has not been behavior- or installation-validated.
+
+Threshold rules and consumer supervision remain in Monitor; the working-tree Host resource wrapper is now `bt_api_py.monitor_threshold_composition`. Its previous Monitor package exports were removed. The cross-package lifecycle has not been validated.
+
+The working-tree Monitor package owns the sole metrics types, default registry, collector, system metrics, exchange-health, Grafana, decorator, Prometheus and ELK implementations used by the SDK's historical monitoring entry. The async decorator, Prometheus and ELK use the former SDK behavior. Direct exporter calls default to `127.0.0.1`; monitoring configuration can explicitly select a different host. Monitoring configuration also lives in `bt_api_monitor.config`, using the former SDK validation and cleanup implementation. The corresponding former SDK submodules are removed; cross-package behavior and distribution compatibility remain unvalidated.
+
 ## Features
 
 ### Core Monitoring
