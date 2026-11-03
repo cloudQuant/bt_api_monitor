@@ -342,18 +342,20 @@ assert 'bt_api_monitor.system_metrics' not in sys.modules
 assert 'psutil' not in sys.modules
 
 # Existing explicit exports still resolve lazily to their defining objects.
-from bt_api_monitor import DurableOutbox, get_logger
+from bt_api_monitor import DurableOutbox, get_logger, monitor_freeze_cause_id
 from bt_api_monitor.durable import DurableOutbox as DirectOutbox
+from bt_api_monitor.control import monitor_freeze_cause_id as direct_freeze_cause_id
 from bt_api_base.logging_factory import get_logger as direct_get_logger
 import bt_api_monitor
 import hashlib
 assert DurableOutbox is DirectOutbox
 assert get_logger is direct_get_logger
+assert monitor_freeze_cause_id is direct_freeze_cause_id
 assert 'DurableOutbox' in dir(bt_api_monitor)
 assert 'DurableOutbox' in bt_api_monitor.__all__
 assert set(bt_api_monitor.__all__) == set(bt_api_monitor._EXPORT_MODULES)
-assert len(bt_api_monitor.__all__) == 95
-assert hashlib.sha256((chr(10).join(bt_api_monitor.__all__)).encode()).hexdigest() == '3d8fa6ce3844ff16648e9eb3123241ea7b8d483eb1ea7b988a642a107635aa87'
+assert len(bt_api_monitor.__all__) == 120
+assert hashlib.sha256((chr(10).join(bt_api_monitor.__all__)).encode()).hexdigest() == '25f7f6e5e00ab0a2f266304a79f7c26e1e4969eaa254bb82f05e7c063713f060'
 """
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)

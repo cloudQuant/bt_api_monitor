@@ -297,6 +297,7 @@ __all__ = [
     "HmacControlCommandVerifier",
     "HmacControlKey",
     "VerifiedControlCommand",
+    "monitor_freeze_cause_id",
     "CONTROL_COMMAND_HMAC_DOMAIN",
     # Decorators
     "monitor_performance",
