@@ -112,6 +112,28 @@ start_prometheus_exporter(port=9090)
 
 ## API Reference
 
+### Gateway relay heartbeat
+
+`GatewayHeartbeatService` is an explicitly installed, passive heartbeat
+responder. It accepts only the `monitor.heartbeat` operation on
+`service.telemetry_ingress`: the service host supplies the authenticated
+service identity and scope, while trusted application code supplies exact
+relay targets and the Monitor principal. The service starts without an active
+epoch validator; the integrated SDK ServiceHost installs its registry-backed
+validator once and checks the Monitor principal against its own authority.
+An already bound service cannot be attached to another host. The relay epoch
+must equal the authenticated registration ID supplied by the host and must
+also pass the current-epoch validator. The response echoes the
+request's version, relay epoch, heartbeat ID and original
+Gateway monotonic send time. It does not initiate a control command, verify
+the Gateway clock, confirm persistence of business events, or grant trading
+readiness. Gateway must validate the authenticated Monitor identity and its
+own outstanding request and timeout before interpreting the response.
+
+The separate `gateway_heartbeat` role requires explicit service-host and
+operation grants. Constructing this component alone does not provide network
+integration or prove Monitor health.
+
 ### Optional ordinary strategy telemetry
 
 The explicit `telemetry_ingress` role receives best-effort heartbeats and flat
