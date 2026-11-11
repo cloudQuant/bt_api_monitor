@@ -23,6 +23,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Optional, Protocol, Union
 
+from bt_api_base.risk_service_protocol import KILL_SWITCH_ACTIONS
+
 
 class ControlLedgerError(RuntimeError):
     """Base error for control-command validation and delivery."""
@@ -49,12 +51,30 @@ class ControlSequenceError(ControlAuthorizationError):
 
 
 class ControlAction(str, Enum):
-    """The supported monitor-to-owner commands."""
+    """The supported monitor-to-owner commands.
+
+    Member names are the shared kill-switch vocabulary
+    ``bt_api_base.risk_service_protocol.KILL_SWITCH_ACTIONS``; the lower-case
+    values are what the ledger has always persisted and do not change. The
+    module refuses to import when the two diverge.
+    """
 
     FREEZE = "freeze"
     STOP_NEW = "stop_new"
     DRAIN = "drain"
     RESUME = "resume"
+
+
+def _require_kill_switch_vocabulary(actions: type[Enum], vocabulary: frozenset[str]) -> None:
+    """Fail closed unless ``actions`` names exactly the shared vocabulary."""
+
+    if type(vocabulary) is not frozenset or frozenset(actions.__members__) != vocabulary:
+        raise RuntimeError("monitor control actions differ from the kill-switch vocabulary")
+    if any(member.value != member.name.lower() for member in actions):
+        raise RuntimeError("monitor control action values differ from their persisted form")
+
+
+_require_kill_switch_vocabulary(ControlAction, KILL_SWITCH_ACTIONS)
 
 
 class ControlStatus(str, Enum):
